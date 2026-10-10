@@ -1,0 +1,20 @@
+[package]
+name = "rmx"
+version = "0.1.0"
+edition = "2021"
+description = "Drive Rex sessions from any terminal, including a phone over ssh"
+
+[[bin]]
+name = "rmx"
+path = "src/main.rs"
+
+[dependencies]
+alacritty_terminal = "0.26"
+libc = "0.2"
+serde_json = "1"
+unicode-width = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
