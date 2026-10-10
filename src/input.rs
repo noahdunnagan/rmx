@@ -69,8 +69,10 @@ impl Mouse {
     pub fn is_motion(&self) -> bool {
         self.cb & 32 != 0
     }
+    /// A left-button press. Not motion with the button held: a finger that
+    /// drifts during a tap sends those, and each would count as a tap.
     pub fn is_left_click(&self) -> bool {
-        self.press && self.cb & 0b1100_0011 == 0
+        self.press && self.cb & 0b1110_0011 == 0
     }
 }
 

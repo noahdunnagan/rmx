@@ -62,16 +62,18 @@ pub struct Chrome {
     pub selected: Color,
 }
 
+/// Assumed when the terminal does not say (not every phone app answers).
+pub const DARK: Rgb = Rgb { r: 0x14, g: 0x14, b: 0x14 };
+
 impl Chrome {
     /// Tint the terminal's own background: lighter on dark themes, darker on light.
-    pub fn from(bg: Option<Rgb>) -> Option<Chrome> {
-        let base = bg?;
+    pub fn from(base: Rgb) -> Chrome {
         let dark = (base.r as u32 * 299 + base.g as u32 * 587 + base.b as u32 * 114) / 1000 < 128;
         let mix = |amt: f32| {
             let ch = |c: u8| (if dark { c as f32 + (255.0 - c as f32) * amt } else { c as f32 - c as f32 * amt }) as u8;
             Color::Spec(Rgb { r: ch(base.r), g: ch(base.g), b: ch(base.b) })
         };
-        Some(Chrome { surface: mix(0.06), hover: mix(0.11), selected: mix(0.17) })
+        Chrome { surface: mix(0.06), hover: mix(0.11), selected: mix(0.17) }
     }
 }
 
@@ -82,12 +84,12 @@ pub struct Frame {
     pub cursor: Option<(usize, usize)>,
     pub cursor_shape: CursorShape,
     pub cursor_blink: bool,
-    /// Surface colours for the chrome, when the terminal told us its background.
-    pub chrome: Option<Chrome>,
+    /// Surface colours for rmx's own parts.
+    pub chrome: Chrome,
 }
 
 impl Frame {
-    pub fn new(cols: usize, rows: usize) -> Self {
+    pub fn new(cols: usize, rows: usize, chrome: Chrome) -> Self {
         Frame {
             cols,
             rows,
@@ -95,7 +97,7 @@ impl Frame {
             cursor: None,
             cursor_shape: CursorShape::Block,
             cursor_blink: false,
-            chrome: None,
+            chrome,
         }
     }
 

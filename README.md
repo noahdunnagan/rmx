@@ -8,9 +8,9 @@ Drive Rex from any terminal, made for a phone over ssh. rmx is a Rex client like
 2. Optional: set the host's startup command to `rmx` so connecting drops you straight in.
 3. Connect and run `rmx`.
 
-On a phone rmx opens on the tab list. Tap a tab to open it, `‹ tabs` to go back, `+ tab` for a new tab next to the current one, `⋯ menu` for everything else. Closing Termius detaches; the tabs keep running.
+On a phone rmx opens on the tab list. Tap a tab to open it, `‹ Tabs` to go back, `+ Tab` for a new tab next to the current one, `⋯` for the rest (scroll back, rename, close, new window, exit). Closing Termius detaches; the tabs keep running.
 
-A session is a group of tabs (what one Rex window shows). Most of the time you only need `+ tab`.
+A window is what Rex shows on the Mac: one window of tabs (Rex calls it a session). Most of the time you only need `+ Tab`.
 
 ## Keys
 
@@ -29,4 +29,9 @@ python3 tools/check.py          # private Rex server, rmx in a pty
 python3 tools/fidelity.py       # rmx's screen vs Rex's for shell, claude, top, vim, less
 python3 tools/ssh_check.py      # through real ssh over Tailscale
 python3 tools/m6_server_check.py  # server start/restart paths, on a spare Mac
+```
+
+The rig's taps include the pointer drift a real finger makes. On a real Mac, cua-driver's clicks carry no pointer motion, so Ghostty reports them at the last cell the pointer moved over; drag the right button onto the target first, then click.
+
+```sh
 ```

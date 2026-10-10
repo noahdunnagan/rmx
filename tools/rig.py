@@ -58,8 +58,10 @@ class Rig:
         return self.pump(settle)
 
     def tap(self, x, y, settle=0.4):
-        """Left click at 0-based cell (x, y), the way Termius sends a tap."""
+        """Left click at 0-based cell (x, y), with the small drift a real
+        finger or cursor makes while pressed (a motion report)."""
         self.send(f"\x1b[<0;{x + 1};{y + 1}M".encode(), 0.05)
+        self.send(f"\x1b[<32;{x + 1};{y + 1}M".encode(), 0.05)
         return self.send(f"\x1b[<0;{x + 1};{y + 1}m".encode(), settle)
 
     def wheel(self, x, y, up=True, n=1, settle=0.3):

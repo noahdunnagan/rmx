@@ -46,10 +46,15 @@ pub enum Confirm {
 /// One line of the rail / list.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Row {
+    /// Phone only: which Mac, and how many tabs need you.
+    Header,
     Session(String),
     Tab(String, String),
     Detail(String, String),
     Block(String, String, String),
+    /// Phone only: the blank line closing a tab's card, so the whole card
+    /// is a comfortable tap target.
+    Gap(String, String),
     AddTab(String),
     AddSession,
     /// "No Rex sessions yet."
@@ -90,25 +95,28 @@ pub struct MenuItem {
     pub action: Action,
     /// Only makes sense with a tab open.
     pub needs_tab: bool,
+    /// Shown on a phone too. The rest have a button of their own there.
+    pub phone: bool,
 }
 
-const fn item(key: &'static str, label: &'static str, hint: &'static str, action: Action, needs_tab: bool) -> MenuItem {
-    MenuItem { key, label, hint, action, needs_tab }
+const fn item(key: &'static str, label: &'static str, hint: &'static str, action: Action, needs_tab: bool, phone: bool) -> MenuItem {
+    MenuItem { key, label, hint, action, needs_tab, phone }
 }
 
-/// The menu, in the order it is shown.
+/// The menu, in the order it is shown. A Rex session is what the Mac shows
+/// as one window of tabs, so rmx calls it a window.
 pub const MENU: [MenuItem; 11] = [
-    item("s", "all tabs", "", Action::Switcher, false),
-    item("c", "new tab", "a shell next to this one", Action::NewTab, false),
-    item("S", "new session", "its own group of tabs", Action::NewSession, false),
-    item("o", "needs you", "next tab waiting on you", Action::Attention, false),
-    item("[", "scroll back", "", Action::Scroll, true),
-    item("r", "rename tab", "", Action::RenameTab, true),
-    item("$", "rename session", "", Action::RenameSession, true),
-    item("x", "close tab", "", Action::CloseTab, true),
-    item("g", "redraw", "and take the size back", Action::Refresh, true),
-    item("b", "sidebar", "show or hide", Action::ToggleRail, false),
-    item("d", "detach", "tabs keep running", Action::Quit, false),
+    item("s", "All tabs", "", Action::Switcher, false, false),
+    item("c", "New tab", "next to this one", Action::NewTab, false, false),
+    item("o", "Needs you", "next tab waiting on you", Action::Attention, false, false),
+    item("[", "Scroll back", "read earlier output", Action::Scroll, true, true),
+    item("r", "Rename tab", "", Action::RenameTab, true, true),
+    item("$", "Rename window", "", Action::RenameSession, true, false),
+    item("x", "Close tab", "stops what runs in it", Action::CloseTab, true, true),
+    item("S", "New window", "its own window on the Mac", Action::NewSession, false, true),
+    item("g", "Redraw", "if the screen looks off", Action::Refresh, true, true),
+    item("b", "Sidebar", "show or hide", Action::ToggleRail, false, false),
+    item("d", "Exit rmx", "your tabs keep running", Action::Quit, false, true),
 ];
 
 fn prefixed(k: &KeyPress) -> Option<Action> {
@@ -204,10 +212,21 @@ impl App {
         self.rail && self.cols >= WIDE
     }
 
+    /// Rows of the bottom bar. On a phone it is tall enough to tap
+    /// comfortably, and gives way when the keyboard makes the screen short.
+    pub fn bar_h(&self) -> usize {
+        match self.rows {
+            _ if self.wide() => 1,
+            r if r >= 30 => 3,
+            r if r >= 18 => 2,
+            _ => 1,
+        }
+    }
+
     /// Where the block is drawn: (x, cols, rows).
     pub fn pane_rect(&self) -> (usize, usize, usize) {
         let x = if self.wide() { RAIL_W } else { 0 };
-        (x, self.cols.saturating_sub(x).max(10), self.rows.saturating_sub(1).max(2))
+        (x, self.cols.saturating_sub(x).max(10), self.rows.saturating_sub(self.bar_h()).max(2))
     }
 
     pub fn error(&mut self, text: impl Into<String>) {
@@ -366,10 +385,7 @@ impl App {
         }
         match self.model.all_tabs().len() {
             0 => self.restart_server(Action::NewTab),
-            tabs => {
-                self.info(format!("Rex can't start new shells: its server is older than the Rex app (Rex updated). Restarting it fixes that but closes the {tabs} open tab{}.", if tabs == 1 { "" } else { "s" }));
-                self.mode = Mode::Confirm(Confirm::Restart { tabs });
-            }
+            tabs => self.mode = Mode::Confirm(Confirm::Restart { tabs }),
         }
     }
 
@@ -442,7 +458,11 @@ impl App {
     // ---- the list -----------------------------------------------------
 
     pub fn rows(&self) -> Vec<Row> {
+        let phone = !self.wide();
         let mut rows = Vec::new();
+        if phone {
+            rows.extend([Row::Header, Row::Blank]);
+        }
         if self.model.sessions.is_empty() {
             rows.extend([Row::Empty, Row::Blank]);
         }
@@ -455,6 +475,9 @@ impl App {
                     for b in &t.blocks {
                         rows.push(Row::Block(s.id.clone(), t.id.clone(), b.clone()));
                     }
+                }
+                if phone {
+                    rows.push(Row::Gap(s.id.clone(), t.id.clone()));
                 }
             }
             rows.push(Row::AddTab(s.id.clone()));
@@ -514,11 +537,12 @@ impl App {
         let sel = self.rows().iter().position(|r| *r == row).unwrap_or(0);
         self.mode = Mode::Normal;
         match row {
-            Row::Tab(s, t) | Row::Detail(s, t) => self.open_tab(&s, &t),
+            Row::Tab(s, t) | Row::Detail(s, t) | Row::Gap(s, t) => self.open_tab(&s, &t),
             Row::Block(s, t, b) => self.open(&s, &t, &b),
             Row::AddTab(s) => self.new_tab(&s),
             Row::AddSession => self.new_session(),
-            Row::Session(_) | Row::Empty | Row::Blank => self.mode = Mode::Switch { sel },
+            Row::Header if self.waiting().0 > 0 => self.attention(),
+            Row::Header | Row::Session(_) | Row::Empty | Row::Blank => self.mode = Mode::Switch { sel },
         }
         // On a phone, a failed open lands back on the list.
         if self.view.is_none() && !self.wide() && matches!(self.mode, Mode::Normal) {
@@ -603,7 +627,15 @@ impl App {
 
     /// Tabs other than this one waiting on the user: (count, any blocked).
     pub fn waiting(&self) -> (usize, bool) {
-        let here = self.here();
+        self.waiting_except(self.here())
+    }
+
+    /// Every tab waiting on the user, this one included.
+    pub fn waiting_all(&self) -> (usize, bool) {
+        self.waiting_except(None)
+    }
+
+    fn waiting_except(&self, here: Option<(String, String)>) -> (usize, bool) {
         let mut count = 0;
         let mut blocked = false;
         for (s, t) in self.model.all_tabs() {
@@ -888,6 +920,15 @@ impl App {
                 }
                 self.mode = Mode::Normal;
             }
+            Tap::Up | Tap::Down => {
+                if let Some(v) = &mut self.view {
+                    let page = (v.want.1 as i32 * 2 / 3).max(1);
+                    v.term.scroll_display(Scroll::Delta(if tap == Tap::Up { page } else { -page }));
+                    if v.term.grid().display_offset() == 0 {
+                        self.mode = Mode::Normal;
+                    }
+                }
+            }
             Tap::Yes => self.answer(true),
             Tap::No => self.answer(false),
             Tap::Quit => self.quit = true,
@@ -899,9 +940,9 @@ impl App {
 
     fn mouse(&mut self, m: Mouse) {
         let (x, y) = (m.x.saturating_sub(1) as usize, m.y.saturating_sub(1) as usize);
-        let footer = self.rows.saturating_sub(1);
+        let footer = self.rows.saturating_sub(self.bar_h());
         let (px, pcols, prows) = self.pane_rect();
-        if y == footer {
+        if y >= footer {
             if m.is_left_click() {
                 if let Some(t) = crate::ui::footer_hit(self, x) {
                     self.tap(t);

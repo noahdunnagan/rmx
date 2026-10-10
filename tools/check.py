@@ -3,7 +3,7 @@ the screen and what Rex itself reports.
 
     python3 tools/check.py          # uses target/debug/rmx (RMX_BIN overrides)
 """
-import base64, json, os, shutil, subprocess, sys, tempfile, time
+import base64, json, os, re, shutil, subprocess, sys, tempfile, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rig import Rig
@@ -76,7 +76,8 @@ def check(name, cond, detail=""):
 
 
 def footer(r):
-    return r.screen.display[-1]
+    """The bottom bar (up to three rows on a phone)."""
+    return "\n".join(r.screen.display[-3:])
 
 
 def tap_text(r, text, settle=1.0):
@@ -84,6 +85,15 @@ def tap_text(r, text, settle=1.0):
     if pos is None:
         raise AssertionError(f"no {text!r} on screen:\n{r.text()}")
     return r.tap(pos[0] + 1, pos[1], settle)
+
+
+def tap_bar(r, text, settle=1.0):
+    """Tap a bar button by its label."""
+    for y in range(r.rows - 1, r.rows - 4, -1):
+        x = r.screen.display[y].find(text)
+        if x >= 0:
+            return r.tap(x + 1, y, settle)
+    raise AssertionError(f"no {text!r} in the bar:\n{footer(r)}")
 
 
 def main():
@@ -99,7 +109,7 @@ def main():
         # ---- wide -----------------------------------------------------
         r = Rig(s.sock, 140, 30, home=home)
         t = r.text()
-        check("rail lists every session", all(n in t for n in ("alpha", "beta", "+ new session")), t)
+        check("rail lists every session", all(n in t for n in ("alpha", "beta", "+ New window")), t)
         r.send("echo typed-$((6*7))\r", 0.8)
         r.wait_for("typed-42")
         captured = s.rex("capture", "-s", "alpha", "-w", "1") + s.rex("capture", "-s", "alpha", "-w", "2") + s.rex("capture", "-s", "beta")
@@ -117,7 +127,7 @@ def main():
         check("rename shows in the rail", "renamed-tab" in r.pump(0.3).text(), r.text())
 
         r.send(b"\x02x", 0.3)
-        check("^B x asks first", "Close renamed-tab?" in footer(r), footer(r))
+        check("^B x asks first", "Close “renamed-tab”?" in r.text() and "Close tab" in footer(r), r.text())
         r.send(b"y", 1.0)
         check("confirm closes the tab", "renamed-tab" not in s.rex("window", "ls", "-s", "alpha"), s.rex("window", "ls", "-s", "alpha"))
         check("rmx survives closing the tab it showed", r.alive() and "alpha" in r.pump(0.5).text(), r.text())
@@ -136,9 +146,9 @@ def main():
         r.send("for i in $(seq 1 200); do echo row-$i; done\r", 1.2)
         r.wheel(60, 10, up=True, n=10, settle=0.4)
         t = r.text()
-        check("wheel scrolls back", "lines back" in footer(r) and "row-150" in t, t)
+        check("wheel scrolls back", "lines up" in footer(r) and "row-150" in t, t)
         r.send(b"q", 0.3)
-        check("q returns to the bottom", "lines back" not in footer(r), footer(r))
+        check("q returns to the bottom", "lines up" not in footer(r), footer(r))
 
         # program modes reach the outer terminal
         r.raw = b""
@@ -166,34 +176,51 @@ def main():
         # ---- phone ----------------------------------------------------
         r = Rig(s.sock, 46, 32, home=home)
         t = r.text()
-        check("phone: starts on the tab list", "+ new session" in t and "‹ tabs" not in footer(r), t)
+        check("phone: starts on the tab list", "+ New window" in t and "Rex on" in t and "‹ Tabs" not in footer(r), t)
         check("phone: viewing nothing until a tab is picked", s.size("beta", block)["owner"] is None, s.size("beta", block))
         x, y = r.find("alpha")
-        r.tap(6, y + 1, 1.0)
-        check("phone: tapping a tab opens it", "‹ tabs" in footer(r) and "+ new session" not in r.text(), r.text())
-        tap_text(r, "‹ tabs", 0.5)
-        check("phone: ‹ tabs goes back to the list", "+ new session" in r.text() and "‹ back" in footer(r), r.text())
-        tap_text(r, "‹ back", 0.5)
-        check("phone: ‹ back returns to the tab", "‹ tabs" in footer(r), footer(r))
-        tap_text(r, "⋯ menu", 0.5)
-        check("phone: ⋯ menu opens the menu", "new session" in r.text() and "its own group of tabs" in r.text(), r.text())
+        r.tap(6, y + 3, 1.0)
+        check("phone: tapping a tab card (even its blank line) opens it", "‹ Tabs" in footer(r) and "+ New window" not in r.text(), r.text())
+        check("phone: the bar is three rows tall", s.size("alpha", s.block("alpha"))["rows"] == 29, s.size("alpha", s.block("alpha")))
+        tap_bar(r, "‹ Tabs", 0.5)
+        check("phone: ‹ Tabs goes back to the list", "+ New window" in r.text() and "Exit" in footer(r), r.text())
+        tap_bar(r, "‹ ", 0.5)
+        check("phone: the back button returns to the tab", "‹ Tabs" in footer(r), footer(r))
+        tap_bar(r, "⋯", 0.5)
+        check("phone: ⋯ opens the menu", "New window" in r.text() and "its own window on the Mac" in r.text() and "Cancel" in footer(r), r.text())
+        tap_bar(r, "Cancel", 0.5)
+        check("phone: Cancel closes the menu", "its own window" not in r.text() and "‹ Tabs" in footer(r), r.text())
+        tap_bar(r, "⋯", 0.5)
         before = s.rex("ls")
-        tap_text(r, "new session", 1.5)
+        x, y = r.find("New window")
+        r.tap(x, y + 1, 1.5)
         after = s.rex("ls")
-        check("phone: tapping a menu entry runs it", after.count("\n") == before.count("\n") + 1, before + "\n" + after)
+        check("phone: tapping a menu slot (even its blank line) runs it", after.count("\n") == before.count("\n") + 1, before + "\n" + after)
         r.send("echo from-phone\r", 0.8)
-        check("phone: typing in the new session", "from-phone" in r.text(), r.text())
-        tap_text(r, "+ tab", 1.5)
-        check("phone: + tab adds a tab to this session", "‹ tabs" in footer(r) and r.alive(), r.text())
+        check("phone: typing in the new window", "from-phone" in r.text(), r.text())
+        tap_bar(r, "+ Tab", 1.5)
+        check("phone: + Tab adds a tab next to this one", "‹ Tabs" in footer(r) and r.alive(), r.text())
+        r.send("for i in $(seq 1 120); do echo row-$i; done\r", 1.2)
+        tap_bar(r, "⋯", 0.5)
+        tap_text(r, "Scroll back", 0.5)
+        lines_up = lambda: int(re.search(r"(\d+) lines up", footer(r)).group(1))
+        first = lines_up()
+        tap_bar(r, "▲ Up", 0.5)
+        check("phone: Scroll back, then ▲ Up goes further", lines_up() > first > 0, footer(r))
+        tap_bar(r, "Done", 0.5)
+        check("phone: Done returns to the bottom", "lines up" not in footer(r) and "‹ Tabs" in footer(r), footer(r))
+        r.resize(46, 16).pump(0.8)
+        check("phone: keyboard up shrinks the bar to one row", "‹ Tabs" in r.screen.display[-1] and "‹ Tabs" not in r.screen.display[-2], footer(r))
+        r.resize(46, 32).pump(0.5)
 
         # The server goes away and comes back (a restart, a Rex update).
         s.kill()
         r.pump(1.0)
-        check("server gone: rmx says so and waits", "reconnecting" in footer(r) and r.alive(), footer(r))
+        check("server gone: rmx says so and waits", "Reconnecting" in footer(r) and r.alive(), footer(r))
         s.start()
         s.rex("new", "gamma", *bash)
         r.pump(2.5)
-        check("server back: rmx reconnects on its own", "reconnecting" not in footer(r) and "gamma" in r.text(), r.text())
+        check("server back: rmx reconnects to the list (a restart ends the old tabs)", "Reconnecting" not in footer(r) and "gamma" in r.text(), r.text())
         status = r.quit()
         check("phone: ^B d exits cleanly", status == 0, status)
     finally:
@@ -203,7 +230,7 @@ def main():
     s = Server(stale=True)
     try:
         r = Rig(s.sock, 46, 30, home=os.path.join(s.dir, "home"))
-        tap_text(r, "+ start a session", 1.5)
+        tap_text(r, "+ New tab", 1.5)
         t = r.text()
         check("stale server: the reason is spelled out", "older than the Rex app" in t and "Old Rex Server" not in t, t)
         r.send(b"x", 0.3)

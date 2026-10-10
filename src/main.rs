@@ -96,6 +96,17 @@ pub fn connect(socket: &std::path::Path, manage_server: bool, generation: u64, t
     Err(format!("started Rex's server but can't reach it ({last})"))
 }
 
+/// This Mac's short name, for the phone's header.
+pub fn host() -> &'static str {
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        let mut buf = [0u8; 256];
+        unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) };
+        let name = String::from_utf8_lossy(&buf[..buf.iter().position(|b| *b == 0).unwrap_or(0)]).into_owned();
+        name.split('.').next().unwrap_or("this Mac").to_string()
+    })
+}
+
 pub fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
 }
@@ -281,7 +292,7 @@ fn run(socket: PathBuf, manage_server: bool) -> Result<(), String> {
             app.tick += 1;
             spun = Instant::now();
         }
-        let list_height = app.rows.saturating_sub(1);
+        let list_height = app.rows.saturating_sub(app.bar_h());
         if app.wide() || matches!(app.mode, Mode::Switch { .. }) {
             app.fit_list(list_height);
         }

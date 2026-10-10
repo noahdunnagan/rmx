@@ -8,7 +8,7 @@ import os, subprocess, sys, time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rig import Rig
-from check import check, passed, failed, footer, tap_text
+from check import check, passed, failed, footer, tap_text, tap_bar
 
 HOST = sys.argv[1]
 REX = '"$HOME/Applications/Rex Beta.app/Contents/Helpers/Rex Server.app/Contents/MacOS/rex"'
@@ -46,7 +46,7 @@ def main():
     check("setup: server stopped", "pid:" not in status(), status())
     r = rmx()
     t = r.text()
-    check("server down: rmx starts it", "pid:" in status() and "No Rex sessions yet." in t, t + "\n" + status())
+    check("server down: rmx starts it", "pid:" in status() and "No tabs open on the Mac yet." in t, t + "\n" + status())
     r.quit()
 
     # 2. A stale server with no tabs: restarted without asking.
@@ -54,10 +54,10 @@ def main():
     check("setup: stale server running from a deleted copy", "Old Rex Server" not in st and "pid:" in st, st)
     old_pid = [l for l in st.splitlines() if l.startswith("pid:")]
     r = rmx()
-    tap_text(r, "+ start a session", 4.0)
+    tap_text(r, "+ New tab", 4.0)
     t = r.text()
     new = status()
-    check("stale + empty: restarted and the session opened", "‹ tabs" in footer(r) and [l for l in new.splitlines() if l.startswith("pid:")] != old_pid, t + "\n" + new)
+    check("stale + empty: restarted and the session opened", "‹ Tabs" in footer(r) and [l for l in new.splitlines() if l.startswith("pid:")] != old_pid, t + "\n" + new)
     r.quit()
 
     # 3. A stale server with a tab open: asks first.
@@ -65,15 +65,15 @@ def main():
     r = rmx()
     x, y = r.find("keepme")
     r.tap(6, y + 1, 1.5)
-    tap_text(r, "+ tab", 1.5)
+    tap_bar(r, "+ Tab", 1.5)
     t = r.text()
-    check("stale + tabs: asks before restarting", "Restart Rex? 1 tab closes" in footer(r) and "Restarting it fixes that" in t, t)
-    tap_text(r, "cancel", 1.0)
+    check("stale + tabs: asks before restarting", "Restart Rex's server?" in t and "closes the 1 open tab." in " ".join(t.split()) and "Restart" in footer(r), t)
+    tap_bar(r, "Cancel", 1.0)
     check("stale + tabs: cancel leaves the tab alone", "keepme" in sh(f"{REX} --autostart=false ls"), sh(f"{REX} --autostart=false ls"))
-    tap_text(r, "+ tab", 1.5)
-    tap_text(r, "restart", 5.0)
+    tap_bar(r, "+ Tab", 1.5)
+    tap_bar(r, "Restart", 5.0)
     t = r.text()
-    check("stale + tabs: restart, then the new tab opens", "‹ tabs" in footer(r) and "Restarted Rex's server." in t, t)
+    check("stale + tabs: restart, then the new tab opens", "‹ Tabs" in footer(r) and "Restarted Rex's server." in t, t)
     print(sh(f"{REX} --autostart=false ls"))
     r.quit()
 
