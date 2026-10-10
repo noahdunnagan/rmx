@@ -14,7 +14,7 @@ A window is what Rex shows on the Mac: one window of tabs (Rex calls it a sessio
 
 ## Keys
 
-`^B` then: `s` tabs, `c` new tab, `S` new session, `n`/`p` next/previous, `o` the next tab waiting on you, `[` scroll back, `r` rename tab, `x` close tab, `g` redraw, `d` detach. `^B ^B` sends a literal `^B`.
+`^B` then: `s` tabs, `c` new tab, `S` new window, `n`/`p` next/previous, `o` the next tab waiting on you, `[` scroll back, `r` rename tab, `x` close tab, `g` redraw, `d` detach. `^B ^B` sends a literal `^B`.
 
 ## Notes
 
@@ -32,6 +32,3 @@ python3 tools/m6_server_check.py  # server start/restart paths, on a spare Mac
 ```
 
 The rig's taps include the pointer drift a real finger makes. On a real Mac, cua-driver's clicks carry no pointer motion, so Ghostty reports them at the last cell the pointer moved over; drag the right button onto the target first, then click.
-
-```sh
-```
