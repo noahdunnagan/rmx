@@ -1,18 +1,30 @@
 //! What rmx draws: the list of sessions and tabs (a rail when the terminal
-//! is wide, a full-screen switcher when it is phone-narrow), the block, a
-//! one-line footer, and the ^B menu.
+//! is wide, the whole screen on a phone), the tab itself, a footer of word
+//! buttons, a message banner, and the menu.
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::point_to_viewport;
 use alacritty_terminal::vte::ansi::{Color, CursorShape, NamedColor};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{Action, App, Mode, Prompt, Row, MENU, RAIL_W};
+use crate::app::{Action, App, Confirm, MenuItem, Mode, Prompt, Row, MENU, RAIL_W, WIDE};
 use crate::model::{Model, State, Status};
 use crate::render::{Cell, Chrome, Frame, Style};
 
 const PAD: usize = 2;
 const SPIN: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// What a tap on a footer button does.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tap {
+    Run(Action),
+    Menu,
+    Back,
+    Bottom,
+    Yes,
+    No,
+    Quit,
+}
 
 fn accent() -> Color {
     Color::Named(NamedColor::Cyan)
@@ -26,17 +38,18 @@ pub fn compose(app: &App) -> Frame {
     let mut f = Frame::new(app.cols, app.rows);
     f.chrome = Chrome::from(app.bg);
     let body = app.rows.saturating_sub(1);
-    let switching = matches!(app.mode, Mode::Switch { .. });
     if app.wide() {
         draw_list(app, &mut f, RAIL_W, body);
         draw_pane(app, &mut f);
-    } else if switching {
+    } else if matches!(app.mode, Mode::Switch { .. }) || app.view.is_none() {
         draw_list(app, &mut f, app.cols, body);
     } else {
         draw_pane(app, &mut f);
     }
     if matches!(app.mode, Mode::Prefix) {
         draw_menu(app, &mut f);
+    } else {
+        draw_banner(app, &mut f, body);
     }
     draw_footer(app, &mut f, body);
     f
@@ -106,10 +119,10 @@ fn draw_list(app: &App, f: &mut Frame, width: usize, height: usize) {
     let current = app.view.as_ref().map(|v| (v.session.clone(), v.tab.clone(), v.block.clone()));
     let mut tint_selected = Vec::new();
     let mut tint_current = Vec::new();
+    let add = Style::color(accent());
     for (idx, row) in rows.iter().enumerate().skip(app.list_offset).take(height) {
         let y = idx - app.list_offset;
-        let selected = sel == Some(idx);
-        if selected {
+        if sel == Some(idx) {
             tint_selected.push(y);
             f.text(0, y, 1, "›", Style::color(accent()).bold());
         }
@@ -119,9 +132,10 @@ fn draw_list(app: &App, f: &mut Frame, width: usize, height: usize) {
                 let Some(session) = app.model.session(s) else { continue };
                 let here = current.as_ref().is_some_and(|c| c.0 == *s);
                 let style = if here { Style::color(accent()).bold() } else { Style::default().bold() };
-                f.text(PAD, y, max, &session.label, style);
-                let n = format!("{}", session.tabs.len());
-                f.text(inner.saturating_sub(n.width() + 1), y, n.width(), &n, dim());
+                let w = f.text(PAD, y, max, &session.label, style);
+                let n = session.tabs.len();
+                let count = format!(" · {n} tab{}", if n == 1 { "" } else { "s" });
+                f.text(PAD + w, y, max.saturating_sub(w), &count, dim());
             }
             Row::Tab(s, t) => {
                 let Some(tab) = app.model.tab(s, t) else { continue };
@@ -156,16 +170,17 @@ fn draw_list(app: &App, f: &mut Frame, width: usize, height: usize) {
                 f.text(PAD + 6, y, inner.saturating_sub(PAD + 7), &name, style);
             }
             Row::AddTab(_) => {
-                f.text(PAD + 4, y, max, "+ tab", dim());
+                f.text(PAD + 4, y, max, "+ new tab", add);
             }
             Row::AddSession => {
-                f.text(PAD, y, max, "+ session", dim());
+                let label = if app.model.sessions.is_empty() { "+ start a session" } else { "+ new session" };
+                f.text(PAD, y, max, label, add.bold());
+            }
+            Row::Empty => {
+                f.text(PAD, y, max, "No Rex sessions yet.", Style::default().bold());
             }
             Row::Blank => {}
         }
-    }
-    if app.model.sessions.is_empty() && height > 2 {
-        f.text(PAD, 0, inner.saturating_sub(PAD), "no Rex sessions yet", dim());
     }
     match chrome {
         Some(ch) => {
@@ -193,7 +208,7 @@ fn draw_list(app: &App, f: &mut Frame, width: usize, height: usize) {
 fn draw_pane(app: &App, f: &mut Frame) {
     let (x0, width, height) = app.pane_rect();
     let Some(v) = &app.view else {
-        let text = if app.model.sessions.is_empty() { "no Rex sessions yet · ^B S starts one" } else { "no tab open · ^B s picks one" };
+        let text = if app.model.sessions.is_empty() { "No Rex sessions yet. Tap + tab to start one." } else { "No tab open. Pick one on the left." };
         f.text(x0 + PAD, 1, width.saturating_sub(PAD), text, dim());
         return;
     };
@@ -234,24 +249,74 @@ fn draw_pane(app: &App, f: &mut Frame) {
     }
 }
 
-// ---- the ^B menu ------------------------------------------------------
+// ---- the banner -------------------------------------------------------
 
-/// (x, y, w, h) of the menu panel: bottom of the pane, above the footer.
-fn menu_rect(app: &App) -> (usize, usize, usize, usize) {
+/// Word-wrap `text` to `width`.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = vec![String::new()];
+    for word in text.split_whitespace() {
+        let line = lines.last_mut().unwrap();
+        if !line.is_empty() && line.width() + 1 + word.width() > width {
+            lines.push(word.to_string());
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    lines
+}
+
+/// The latest message, right above the footer, until the next key or tap.
+fn draw_banner(app: &App, f: &mut Frame, footer: usize) {
+    let Some(note) = &app.note else { return };
+    let lines: Vec<String> = wrap(&note.text, app.cols.saturating_sub(PAD * 2)).into_iter().take(5).collect();
+    let top = footer.saturating_sub(lines.len() + 2);
+    let h = footer - top;
+    f.fill(0, top, app.cols, h, Style::default());
+    let style = if note.error { Style::fg(NamedColor::Red).bold() } else { Style::default() };
+    for (i, line) in lines.iter().enumerate() {
+        f.text(PAD, top + 1 + i, app.cols.saturating_sub(PAD), line, style);
+    }
+    if let Some(ch) = f.chrome {
+        f.tint(0, top, app.cols, h, ch.selected);
+    }
+    f.cursor = None;
+}
+
+// ---- the menu ---------------------------------------------------------
+
+fn menu_items(app: &App) -> Vec<&'static MenuItem> {
+    MENU.iter().filter(|m| (!m.needs_tab || app.view.is_some()) && (m.action != Action::ToggleRail || app.cols >= WIDE)).collect()
+}
+
+/// (x, y, w, h, row height) of the menu sheet: bottom of the screen, above
+/// the footer. Rows get a blank line under them when there is room, so they
+/// are easy to tap.
+fn menu_rect(app: &App) -> (usize, usize, usize, usize, usize) {
     let (px, pcols, prows) = app.pane_rect();
-    let h = (MENU.len() + 1).min(prows);
-    let w = if app.wide() { pcols.min(34) } else { app.cols };
-    (if app.wide() { px } else { 0 }, prows - h, w, h)
+    let n = menu_items(app).len();
+    let row_h = if n * 2 + 2 <= prows { 2 } else { 1 };
+    let h = (n * row_h + 2).min(prows);
+    let (x, w) = if app.wide() { (px, pcols.min(52)) } else { (0, app.cols) };
+    (x, prows - h, w, h, row_h)
 }
 
 fn draw_menu(app: &App, f: &mut Frame) {
-    let (x, y, w, h) = menu_rect(app);
+    let (x, y, w, h, row_h) = menu_rect(app);
     f.fill(x, y, w, h, Style::default());
-    f.text(x + PAD, y, w.saturating_sub(PAD), "rmx · tap or press a key", dim());
-    for (i, (key, label, _)) in MENU.iter().take(h - 1).enumerate() {
-        let row = y + 1 + i;
-        f.text(x + PAD, row, 2, key, Style::color(accent()).bold());
-        f.text(x + PAD + 4, row, w.saturating_sub(PAD + 5), label, Style::default());
+    f.text(x + PAD, y, w.saturating_sub(PAD), "menu · or ^B then the key", dim());
+    let label_w = 15;
+    for (i, item) in menu_items(app).iter().enumerate() {
+        let row = y + 2 + i * row_h - (row_h - 1).min(1);
+        if row >= y + h {
+            break;
+        }
+        f.text(x + PAD, row, label_w, item.label, Style::default().bold());
+        let hint_w = w.saturating_sub(PAD + label_w + 5);
+        f.text(x + PAD + label_w, row, hint_w, item.hint, dim());
+        f.text(x + w.saturating_sub(3), row, 1, item.key, Style::color(accent()));
     }
     match f.chrome {
         Some(ch) => f.tint(x, y, w, h, ch.selected),
@@ -259,141 +324,162 @@ fn draw_menu(app: &App, f: &mut Frame) {
             for col in x..x + w {
                 f.put(col, y, Cell { c: '─', zw: None, style: dim() });
             }
-            f.text(x + PAD, y, w.saturating_sub(PAD), " rmx · tap or press a key ", dim());
+            f.text(x + PAD, y, w.saturating_sub(PAD), " menu · or ^B then the key ", dim());
         }
     }
     f.cursor = None;
 }
 
 pub fn menu_hit(app: &App, x: usize, y: usize) -> Option<Action> {
-    let (mx, my, w, h) = menu_rect(app);
+    let (mx, my, w, h, row_h) = menu_rect(app);
     if x < mx || x >= mx + w || y <= my || y >= my + h {
         return None;
     }
-    MENU.get(y - my - 1).map(|m| m.2)
+    let first = my + 2 - (row_h - 1).min(1);
+    let i = y.checked_sub(first.saturating_sub(row_h - 1))? / row_h;
+    menu_items(app).get(i).map(|m| m.action)
 }
 
 // ---- the footer -------------------------------------------------------
 
-/// Footer buttons right to left: (text, action). None opens the ^B menu.
-fn buttons(app: &App) -> Vec<(String, Option<Action>)> {
+struct Button {
+    text: String,
+    tap: Tap,
+    style: Style,
+}
+
+fn button(text: impl Into<String>, tap: Tap) -> Button {
+    Button { text: text.into(), tap, style: Style::color(accent()).bold() }
+}
+
+/// The footer's parts: buttons on the left, a line of text, buttons on the
+/// right.
+fn footer_parts(app: &App) -> (Vec<Button>, String, Style, Vec<Button>) {
     let narrow = !app.wide();
-    let mut b = vec![(" ^B ".to_string(), None), (if narrow { "+" } else { "+ tab" }.to_string(), Some(Action::NewTab)), (if narrow { "☰" } else { "tabs" }.to_string(), Some(Action::Switcher))];
-    let (waiting, _) = app.waiting();
-    if waiting > 0 {
-        b.push((format!("● {waiting}"), Some(Action::Attention)));
+    if app.lost.is_some() {
+        return (vec![], "Lost Rex's server, reconnecting…".into(), Style::fg(NamedColor::Yellow), vec![button("quit", Tap::Quit)]);
     }
-    b
-}
-
-/// Each button's span, right-aligned with a gap of two.
-fn button_spans(app: &App) -> Vec<(usize, usize, String, Option<Action>)> {
-    let mut right = app.cols.saturating_sub(1);
-    let mut spans = Vec::new();
-    for (text, action) in buttons(app) {
-        let w = text.width();
-        let Some(start) = right.checked_sub(w) else { break };
-        spans.push((start, w, text, action));
-        right = start.saturating_sub(2);
+    let (status_text, status_style) = breadcrumb(app);
+    match &app.mode {
+        Mode::Confirm(Confirm::Close { name, .. }) => (
+            vec![],
+            format!("Close {name}?"),
+            Style::default().bold(),
+            vec![Button { style: Style::fg(NamedColor::Red).bold(), ..button("close", Tap::Yes) }, button("cancel", Tap::No)],
+        ),
+        Mode::Confirm(Confirm::Restart { tabs }) => (
+            vec![],
+            if *tabs == 1 { "Restart Rex? 1 tab closes".into() } else { format!("Restart Rex? {tabs} tabs close") },
+            Style::default().bold(),
+            vec![Button { style: Style::fg(NamedColor::Red).bold(), ..button("restart", Tap::Yes) }, button("cancel", Tap::No)],
+        ),
+        Mode::Prompt { kind, .. } => {
+            let label = match kind {
+                Prompt::RenameTab(..) => "tab name: ",
+                Prompt::RenameSession(_) => "session name: ",
+            };
+            (vec![], label.into(), dim(), vec![button("save", Tap::Yes), button("cancel", Tap::No)])
+        }
+        Mode::Scroll => {
+            let lines = app.view.as_ref().map(|v| v.term.grid().display_offset()).unwrap_or(0);
+            (vec![], format!("↑ {lines} lines back"), Style::fg(NamedColor::Yellow), vec![button("bottom", Tap::Bottom)])
+        }
+        Mode::Switch { .. } if narrow => {
+            let left = if app.view.is_some() { vec![button("‹ back", Tap::Back)] } else { vec![] };
+            let hint = if app.view.is_some() { "" } else if app.model.sessions.is_empty() { "" } else { "tap a tab to open it" };
+            (left, hint.into(), dim(), vec![button("⋯ menu", Tap::Menu)])
+        }
+        Mode::Switch { .. } => (vec![], "↑↓ enter · c new tab · x close · esc".into(), dim(), vec![button("⋯ menu", Tap::Menu)]),
+        Mode::Normal | Mode::Prefix => {
+            let left = if narrow { vec![button("‹ tabs", Tap::Run(Action::Switcher))] } else { vec![] };
+            let mut right = Vec::new();
+            let (waiting, blocked) = app.waiting();
+            if waiting > 0 {
+                let color = if blocked { NamedColor::Yellow } else { NamedColor::Green };
+                right.push(Button { style: Style::fg(color).bold(), ..button(format!("● {waiting}"), Tap::Run(Action::Attention)) });
+            }
+            right.push(button("+ tab", Tap::Run(Action::NewTab)));
+            let menu = if matches!(app.mode, Mode::Prefix) { Button { style: Style::color(accent()).bold().inverse(), ..button("⋯ menu", Tap::Menu) } } else { button("⋯ menu", Tap::Menu) };
+            right.push(menu);
+            (left, status_text, status_style, right)
+        }
     }
-    spans
 }
 
-/// What a tap on the footer at `x` does in normal mode: a button's action,
-/// the switcher for the breadcrumb, None (the menu) for the ^B button.
-pub fn footer_hit(app: &App, x: usize) -> Option<Action> {
-    let spans = button_spans(app);
-    match spans.iter().find(|(s, w, ..)| x >= *s && x < s + w) {
-        Some((.., action)) => *action,
-        None if spans.last().is_some_and(|(s, ..)| x < *s) => Some(Action::Switcher),
-        None => None,
+/// Where each footer piece sits: buttons as (x, width, button), and the
+/// text's (x, max width). Buttons carry a space of padding either side.
+fn footer_layout(app: &App) -> (Vec<(usize, usize, Button)>, String, Style, (usize, usize)) {
+    let (left, text, style, right) = footer_parts(app);
+    let mut placed = Vec::new();
+    let mut x = 0;
+    for b in left {
+        let w = b.text.width() + 2;
+        placed.push((x, w, b));
+        x += w + 1;
+    }
+    let text_x = x + 1;
+    let mut end = app.cols;
+    let mut rights = Vec::new();
+    for b in right.into_iter().rev() {
+        let w = b.text.width() + 2;
+        let Some(start) = end.checked_sub(w).filter(|s| *s > text_x + 4) else { break };
+        rights.push((start, w, b));
+        end = start.saturating_sub(1);
+    }
+    placed.extend(rights.into_iter().rev());
+    (placed, text, style, (text_x, end.saturating_sub(text_x + 1)))
+}
+
+pub fn footer_hit(app: &App, x: usize) -> Option<Tap> {
+    let (buttons, _, _, (tx, tw)) = footer_layout(app);
+    if let Some((.., b)) = buttons.into_iter().find(|(s, w, _)| x >= *s && x < s + w) {
+        return Some(b.tap);
+    }
+    // The text is a button too: on a phone it leads to the list and back.
+    let on_text = x >= tx && x < tx + tw;
+    match app.mode {
+        Mode::Normal if on_text && !app.wide() && app.lost.is_none() => Some(Tap::Run(Action::Switcher)),
+        Mode::Switch { .. } if on_text && app.view.is_some() => Some(Tap::Back),
+        Mode::Prefix => Some(Tap::Menu),
+        _ => None,
     }
 }
 
-fn confirm_spans(app: &App) -> [(usize, usize); 2] {
-    let close = "[ close ]".width();
-    let cancel = "[ cancel ]".width();
-    let cancel_x = app.cols.saturating_sub(cancel + 1);
-    [(cancel_x.saturating_sub(close + 2), close), (cancel_x, cancel)]
-}
-
-/// Some(true) on [ close ], Some(false) on [ cancel ].
-pub fn confirm_hit(app: &App, x: usize) -> Option<bool> {
-    let [(cx, cw), (nx, nw)] = confirm_spans(app);
-    if x >= cx && x < cx + cw {
-        Some(true)
-    } else if x >= nx && x < nx + nw {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-/// "session › tab", or just the tab when that is all that fits in `max`.
-fn breadcrumb(app: &App, max: usize) -> (String, Style) {
+fn breadcrumb(app: &App) -> (String, Style) {
     let Some(v) = &app.view else { return ("rmx".into(), dim()) };
     let session = app.model.session(&v.session).map(|s| s.label.clone()).unwrap_or_default();
     let tab = app.model.tab(&v.session, &v.tab).map(|t| app.model.tab_name(t)).unwrap_or_default();
     if v.sized_by_other {
-        return (format!("{tab} · sized by another Rex client · ^B g takes it"), Style::fg(NamedColor::Yellow));
+        return (format!("{tab} · Mac has the size, type to take it"), Style::fg(NamedColor::Yellow));
     }
-    let full = format!("{session} › {tab}");
-    (if full.width() <= max { full } else { tab }, dim())
+    if app.wide() {
+        return (format!("{session} › {tab}"), dim());
+    }
+    (tab, Style::default())
 }
 
 fn draw_footer(app: &App, f: &mut Frame, y: usize) {
-    let cols = app.cols;
-    let note = app.note.as_ref().filter(|(_, at)| at.elapsed().as_secs() < 4).map(|(t, _)| t.clone());
-    match &app.mode {
-        Mode::Confirm { name, .. } => {
-            let [(cx, cw), (nx, nw)] = confirm_spans(app);
-            f.text(PAD, y, cx.saturating_sub(PAD + 1), &format!("close {name}?"), Style::default().bold());
-            f.text(cx, y, cw, "[ close ]", Style::fg(NamedColor::Red).bold());
-            f.text(nx, y, nw, "[ cancel ]", Style::default());
-        }
-        Mode::Prompt { kind, buf } => {
-            let label = match kind {
-                Prompt::RenameTab(..) => "rename tab › ",
-                Prompt::RenameSession(_) => "rename session › ",
-            };
-            let x = PAD + f.text(PAD, y, cols.saturating_sub(PAD), label, dim());
-            let w = f.text(x, y, cols.saturating_sub(x + 1), buf, Style::color(accent()).bold());
-            f.cursor = Some((x + w, y));
-            f.cursor_shape = CursorShape::Beam;
-        }
-        Mode::Scroll => {
-            let lines = app.view.as_ref().map(|v| v.term.grid().display_offset()).unwrap_or(0);
-            let text = if app.wide() { format!("scrolled {lines} lines · ↑↓ pgup pgdn g G · q or tap here returns") } else { format!("↑ {lines} · tap or q returns") };
-            f.text(PAD, y, cols.saturating_sub(PAD + 1), &text, Style::fg(NamedColor::Yellow));
-        }
-        Mode::Switch { .. } => {
-            let text = if app.wide() || cols >= 70 { "↑↓ pick · enter opens · c new tab · S new session · x close · r rename · esc" } else { "↑↓ enter · c tab · S session · x · esc" };
-            f.text(PAD, y, cols.saturating_sub(PAD + 1), text, dim());
-        }
-        Mode::Normal | Mode::Prefix => {
-            let spans = button_spans(app);
-            let left_max = spans.last().map(|(s, ..)| s.saturating_sub(PAD + 2)).unwrap_or(cols);
-            let (text, style) = match note {
-                Some(n) => (n, Style::fg(NamedColor::Red)),
-                None => breadcrumb(app, left_max.saturating_sub(2)),
-            };
-            let status = app.view.as_ref().and_then(|v| app.model.tab(&v.session, &v.tab)).and_then(|t| app.model.tab_status(t));
-            let (g, gs) = glyph(app, status);
-            f.text(PAD, y, 1, &g, gs);
-            f.text(PAD + 2, y, left_max.saturating_sub(2), &text, style);
-            let (_, blocked) = app.waiting();
-            for (x, w, text, action) in spans {
-                let style = match action {
-                    None if matches!(app.mode, Mode::Prefix) => Style::color(accent()).bold().inverse(),
-                    None => Style::color(accent()).bold(),
-                    Some(Action::Attention) => Style::fg(if blocked { NamedColor::Yellow } else { NamedColor::Green }).bold(),
-                    Some(_) => Style::default(),
-                };
-                f.text(x, y, w, &text, style);
-            }
-        }
+    let (buttons, text, style, (tx, tw)) = footer_layout(app);
+    let mut x = tx;
+    if matches!(app.mode, Mode::Normal | Mode::Prefix) && app.lost.is_none() {
+        let status = app.view.as_ref().and_then(|v| app.model.tab(&v.session, &v.tab)).and_then(|t| app.model.tab_status(t));
+        let (g, gs) = glyph(app, status);
+        f.text(x, y, 1, &g, gs);
+        x += 2;
+    }
+    let w = f.text(x, y, (tx + tw).saturating_sub(x), &text, style);
+    if let Mode::Prompt { buf, .. } = &app.mode {
+        let bw = f.text(x + w, y, (tx + tw).saturating_sub(x + w), buf, Style::color(accent()).bold());
+        f.cursor = Some((x + w + bw, y));
+        f.cursor_shape = CursorShape::Beam;
+    }
+    for (bx, bw, b) in &buttons {
+        f.text(bx + 1, y, bw - 2, &b.text, b.style);
     }
     if let Some(ch) = f.chrome {
-        f.tint(0, y, cols, 1, ch.surface);
+        f.tint(0, y, app.cols, 1, ch.surface);
+        for (bx, bw, _) in &buttons {
+            f.tint(*bx, y, *bw, 1, ch.selected);
+        }
     }
 }

@@ -2,7 +2,9 @@
 //! Rex's own terminal is the real one; the mirror only draws, so anything it
 //! would answer back (DSR, colour queries) is dropped.
 use std::path::Path;
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
+use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::Dimensions;
@@ -55,31 +57,24 @@ pub struct View {
     pub want: (usize, usize),
     /// Who sized the block last, when it was not us.
     pub sized_by_other: bool,
+    /// Output messages applied, to compare with what the stream has read.
+    fed: u64,
+    last_output: Instant,
+    /// Set by a resize: re-read Rex's screen once output goes quiet.
+    stale: bool,
 }
 
 impl View {
     #[allow(clippy::too_many_arguments)]
     pub fn open(rex: &Control, socket: &Path, session: &str, tab: &str, block: &str, size: (usize, usize), generation: u64, tx: Sender<Msg>) -> Result<View, String> {
-        // Seed from Rex's own rendering (screen + scrollback + modes) at the
-        // block's current size, then follow the live stream. The binary
-        // snapshot on the stream would be gap-free, but it is Ghostty's
-        // private format.
-        let now = rex.block(session, block, "size", json!({}))?;
-        let current = Size { cols: now["columns"].as_u64().unwrap_or(80) as usize, rows: now["rows"].as_u64().unwrap_or(24) as usize };
-        let seed = rex.block(
-            session,
-            block,
-            "format",
-            json!({"format": "vt", "extra_modes": true, "extra_cursor": true, "extra_style": true, "extra_scrolling_region": true,
-                   "extra_tabstops": true, "extra_charsets": true, "extra_keyboard": true, "extra_kitty_keyboard": true}),
-        )?;
+        // Seed from Rex's own rendering at the block's current size, then
+        // follow the live stream. (The stream's own binary snapshot would be
+        // gap-free, but it is Ghostty's private format.)
+        let seed = seed(rex, session, block)?;
         let ticket = rex.call("data.connect", json!({"session_id": session, "block_id": block, "data_ref_id": "terminal", "subprotocol": "rex.data.terminal.v1"}))?;
         let ticket = ticket["ticket"].as_str().and_then(crate::base64::decode).ok_or("rex sent a bad data ticket")?;
         let stream = DataStream::open(socket, &ticket, generation, tx).map_err(|e| e.to_string())?;
-        let config = Config { scrolling_history: SCROLLBACK, kitty_keyboard: true, ..Config::default() };
-        let mut term = Term::new(config, &current, Sink);
-        let mut parser = Processor::new();
-        parser.advance(&mut term, seed["content"].as_str().unwrap_or_default().as_bytes());
+        let (term, parser) = seeded(&seed);
         // Only now take the size: Rex marks the resize in the stream and the
         // program's redraw follows it, so neither can fall between the seed
         // and the stream.
@@ -95,11 +90,35 @@ impl View {
             held: Vec::new(),
             want: size,
             sized_by_other: false,
+            fed: 0,
+            last_output: Instant::now(),
+            stale: false,
         })
+    }
+
+    /// After a resize, Rex (Ghostty) and the mirror reflow wrapped lines
+    /// differently, so once the block goes quiet, start over from Rex's own
+    /// screen. Only when nothing arrived meanwhile, so no output is lost or
+    /// applied twice. True when the mirror was replaced.
+    pub fn resync(&mut self, rex: &Control) -> bool {
+        let received = &self.stream.received;
+        let quiet = self.last_output.elapsed() > Duration::from_millis(150) && received.load(Ordering::SeqCst) == self.fed;
+        if !self.stale || !quiet || self.term.grid().display_offset() > 0 {
+            return false;
+        }
+        let Ok(seed) = seed(rex, &self.session, &self.block) else { return false };
+        if received.load(Ordering::SeqCst) != self.fed {
+            return false;
+        }
+        (self.term, self.parser) = seeded(&seed);
+        self.stale = false;
+        true
     }
 
     /// Live output, with Rex's in-band messages applied where they sit.
     pub fn feed(&mut self, bytes: &[u8], me: &str) {
+        self.fed += 1;
+        self.last_output = Instant::now();
         let mut buf = std::mem::take(&mut self.held);
         buf.extend_from_slice(bytes);
         let mut rest = &buf[..];
@@ -138,8 +157,31 @@ impl View {
         }
         let (Some(cols), Some(rows)) = (v["cols"].as_u64(), v["rows"].as_u64()) else { return };
         self.term.resize(Size { cols: cols as usize, rows: rows as usize });
+        self.stale = true;
         self.sized_by_other = v["owner"].as_str().is_some_and(|o| o != me);
     }
+}
+
+/// Rex's rendering of the block: screen, scrollback, modes, at its size.
+fn seed(rex: &Control, session: &str, block: &str) -> Result<(Size, String), String> {
+    let size = rex.block(session, block, "size", json!({}))?;
+    let size = Size { cols: size["columns"].as_u64().unwrap_or(80) as usize, rows: size["rows"].as_u64().unwrap_or(24) as usize };
+    let screen = rex.block(
+        session,
+        block,
+        "format",
+        json!({"format": "vt", "extra_modes": true, "extra_cursor": true, "extra_style": true, "extra_scrolling_region": true,
+               "extra_tabstops": true, "extra_charsets": true, "extra_keyboard": true, "extra_kitty_keyboard": true}),
+    )?;
+    Ok((size, screen["content"].as_str().unwrap_or_default().to_string()))
+}
+
+fn seeded((size, screen): &(Size, String)) -> (Term<Sink>, Processor) {
+    let config = Config { scrolling_history: SCROLLBACK, kitty_keyboard: true, ..Config::default() };
+    let mut term = Term::new(config, size, Sink);
+    let mut parser = Processor::new();
+    parser.advance(&mut term, screen.as_bytes());
+    (term, parser)
 }
 
 fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {

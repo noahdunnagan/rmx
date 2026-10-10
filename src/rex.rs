@@ -10,7 +10,9 @@
 //! output. Input does not go here; it is the control `write` method.
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -31,7 +33,9 @@ pub struct Control {
 }
 
 impl Control {
-    pub fn connect(socket: &Path, tx: Sender<Msg>) -> io::Result<Control> {
+    /// `generation` tags this connection's messages, so a replaced one's
+    /// last words are ignored.
+    pub fn connect(socket: &Path, generation: u64, tx: Sender<Msg>) -> io::Result<Control> {
         let (writer, mut reader) = ws::connect(socket, "/api/control", "rex.control.v1")?;
         let hello = json!({"type": "hello", "client": {"kind": "cli", "platform": "macos", "name": "rmx", "version": env!("CARGO_PKG_VERSION")}});
         writer.send(TEXT, hello.to_string().as_bytes())?;
@@ -45,7 +49,7 @@ impl Control {
             let message = match reader.recv() {
                 Ok((_, bytes)) => serde_json::from_slice::<Value>(&bytes).unwrap_or(Value::Null),
                 Err(e) => {
-                    let _ = tx.send(Msg::ControlGone(e.to_string()));
+                    let _ = tx.send(Msg::ControlGone(generation, e.to_string()));
                     return;
                 }
             };
@@ -61,7 +65,7 @@ impl Control {
                     }
                 }
                 Some("event") => {
-                    let _ = tx.send(Msg::Event(message["payload"].clone()));
+                    let _ = tx.send(Msg::Event(generation, message["payload"].clone()));
                 }
                 _ => {}
             }
@@ -107,6 +111,8 @@ pub struct DataStream {
     /// Signs the `ESC _ rex1;<token>;{json} ESC \` messages Rex puts in the
     /// stream, so a program cannot forge one.
     pub token: u64,
+    /// Output messages read off the socket so far.
+    pub received: Arc<AtomicU64>,
 }
 
 impl DataStream {
@@ -122,13 +128,17 @@ impl DataStream {
         let token = u64::from_le_bytes(welcome[24..32].try_into().unwrap());
         // The snapshot is Ghostty's binary state dump; rmx seeds its screen
         // from the `format` method instead and only keeps the live bytes.
+        let received = Arc::new(AtomicU64::new(0));
         let (_, first) = reader.recv()?;
         if !first.starts_with(b"GHOSTSNP") {
+            received.fetch_add(1, Ordering::SeqCst);
             let _ = tx.send(Msg::Data(generation, first));
         }
+        let count = received.clone();
         thread::spawn(move || loop {
             match reader.recv() {
                 Ok((_, bytes)) => {
+                    count.fetch_add(1, Ordering::SeqCst);
                     if tx.send(Msg::Data(generation, bytes)).is_err() {
                         return;
                     }
@@ -139,7 +149,7 @@ impl DataStream {
                 }
             }
         });
-        Ok(DataStream { writer, token })
+        Ok(DataStream { writer, token, received })
     }
 }
 
@@ -147,4 +157,41 @@ impl Drop for DataStream {
     fn drop(&mut self) {
         self.writer.shutdown();
     }
+}
+
+/// The `rex` binary inside the installed Rex app. Where it sits in the bundle
+/// has moved between releases, so look for it.
+pub fn find_rex() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("REX_BIN") {
+        return Some(path.into());
+    }
+    let roots = [PathBuf::from("/Applications"), crate::home().join("Applications")];
+    let apps = ["Rex Beta.app", "Rex.app"];
+    roots.iter().flat_map(|r| apps.iter().map(move |a| r.join(a).join("Contents/Helpers"))).find_map(|dir| find_file(&dir, "rex", 4))
+}
+
+fn find_file(dir: &Path, name: &str, depth: usize) -> Option<PathBuf> {
+    let entries: Vec<_> = std::fs::read_dir(dir).ok()?.flatten().collect();
+    let hit = entries.iter().map(|e| e.path()).find(|p| p.is_file() && p.file_name().is_some_and(|n| n == name));
+    hit.or_else(|| entries.iter().map(|e| e.path()).filter(|p| depth > 0 && p.is_dir()).find_map(|p| find_file(&p, name, depth - 1)))
+}
+
+/// Start Rex's server the way the Rex app does. A no-op when one is running;
+/// the Rex app attaches to it on its own.
+pub fn start_server(rex: &Path) -> Result<(), String> {
+    let flags = ["--websocket-origin-pattern", "https://rex.superlogical.com", "--log-max-size", "50MiB", "--log-format", "text"];
+    run(Command::new(rex).args(["server", "start"]).args(flags))
+}
+
+/// Stop the running server. Every open tab ends with it.
+pub fn stop_server(rex: &Path) -> Result<(), String> {
+    run(Command::new(rex).args(["--autostart=false", "server", "stop"]))
+}
+
+fn run(cmd: &mut Command) -> Result<(), String> {
+    let out = cmd.output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return Ok(());
+    }
+    Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
 }

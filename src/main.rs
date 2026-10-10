@@ -24,8 +24,9 @@ use crate::render::Frame;
 pub enum Msg {
     Input(Vec<u8>),
     InputGone,
-    Event(serde_json::Value),
-    ControlGone(String),
+    /// From control connection N.
+    Event(u64, serde_json::Value),
+    ControlGone(u64, String),
     Data(u64, Vec<u8>),
     DataGone(u64),
 }
@@ -39,7 +40,8 @@ usage: rmx [--server PATH]
   ^B r   rename tab  ^B x   close tab     ^B d   detach
   ^B ^B  send ^B     tap the footer for buttons and the full menu
 
-The server is REX_SERVER (unix://...) or Rex's default socket.";
+The server is REX_SERVER (unix://...) or Rex's own, which rmx starts if
+it is not running.";
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -57,7 +59,8 @@ fn main() {
             _ => return println!("{USAGE}"),
         }
     }
-    if let Err(e) = run(socket_path(server)) {
+    let manage_server = server.is_none();
+    if let Err(e) = run(socket_path(server), manage_server) {
         eprintln!("rmx: {e}");
         std::process::exit(1);
     }
@@ -70,7 +73,30 @@ fn socket_path(server: Option<String>) -> PathBuf {
     }
 }
 
-fn home() -> PathBuf {
+/// Connect to Rex. When rmx manages Rex's own server and it is not running
+/// (the Rex app is closed, say), start it first.
+pub fn connect(socket: &std::path::Path, manage_server: bool, generation: u64, tx: mpsc::Sender<Msg>) -> Result<rex::Control, String> {
+    let first = rex::Control::connect(socket, generation, tx.clone());
+    let down = |e: &std::io::Error| matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused);
+    match first {
+        Ok(c) => return Ok(c),
+        Err(e) if !(manage_server && down(&e)) => return Err(format!("can't reach the Rex server at {} ({e})", socket.display())),
+        Err(_) => {}
+    }
+    let bin = rex::find_rex().ok_or("Rex isn't running and rmx can't find the Rex app to start it")?;
+    rex::start_server(&bin).map_err(|e| format!("couldn't start Rex's server: {e}"))?;
+    let mut last = String::new();
+    for _ in 0..50 {
+        match rex::Control::connect(socket, generation, tx.clone()) {
+            Ok(c) => return Ok(c),
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(format!("started Rex's server but can't reach it ({last})"))
+}
+
+pub fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".into()))
 }
 
@@ -164,10 +190,10 @@ fn write_out(bytes: &[u8]) {
     let _ = out.flush();
 }
 
-fn run(socket: PathBuf) -> Result<(), String> {
+fn run(socket: PathBuf, manage_server: bool) -> Result<(), String> {
     let (cols, rows) = window_size().ok_or("rmx needs a terminal")?;
     let (tx, rx) = mpsc::channel();
-    let rex = rex::Control::connect(&socket, tx.clone()).map_err(|e| format!("cannot reach the Rex server at {} ({e}). Is Rex running?", socket.display()))?;
+    let rex = connect(&socket, manage_server, 0, tx.clone())?;
     let model = Model::load(&rex)?;
     unsafe {
         libc::signal(libc::SIGHUP, on_signal as *const () as libc::sighandler_t);
@@ -192,8 +218,8 @@ fn run(socket: PathBuf) -> Result<(), String> {
             }
         }
     });
-    let mut app = App::new(rex, socket, tx, model, cols, rows);
-    app.open_initial(load_last());
+    let mut app = App::new(rex, socket, manage_server, tx, model, cols, rows);
+    app.home(load_last());
     let mut prev: Option<Frame> = None;
     let mut spun = Instant::now();
     let mut farewell = None;
@@ -212,14 +238,17 @@ fn run(socket: PathBuf) -> Result<(), String> {
             match msg {
                 Msg::Input(bytes) => app.input(&bytes),
                 Msg::InputGone => app.quit = true,
-                Msg::Event(ev) => {
+                Msg::Event(generation, ev) if generation == app.control_gen => {
                     app.event(&ev);
                     shape_changed = true;
                 }
-                Msg::ControlGone(e) => {
+                Msg::Event(..) => {}
+                Msg::ControlGone(generation, e) if generation == app.control_gen => {
                     farewell = Some(format!("lost the Rex server ({e})"));
-                    app.quit = true;
+                    app.lost.get_or_insert_with(Instant::now);
+                    app.view = None;
                 }
+                Msg::ControlGone(..) => {}
                 Msg::Data(generation, bytes) => app.data(generation, &bytes),
                 Msg::DataGone(generation) => {
                     app.data_gone(generation);
@@ -230,8 +259,19 @@ fn run(socket: PathBuf) -> Result<(), String> {
                 next = rx.try_recv().ok();
             }
         }
-        if shape_changed {
+        // The server went away (restart, Rex update, Rex quit): try to get
+        // it back for a while before giving up.
+        if let Some(since) = app.lost {
+            if app.reconnect().is_ok() {
+                farewell = None;
+            } else if since.elapsed() > Duration::from_secs(30) {
+                break;
+            }
+        } else if shape_changed {
             app.settle();
+        }
+        if let Some(v) = app.view.as_mut() {
+            v.resync(&app.rex);
         }
         app.mirror_modes();
         if let Some((c, r)) = window_size().filter(|s| *s != (app.cols, app.rows)) {

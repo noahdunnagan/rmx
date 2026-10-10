@@ -2,7 +2,7 @@
 private Rex server, views each through rmx, and diffs rmx's pane against
 `rex capture` once the program settles.
 
-    python3 tools/fidelity.py [program ...]    # default: claude, top, vim, less
+    python3 tools/fidelity.py [program ...]    # default: all of PROGRAMS
 """
 import os, sys, time
 
@@ -11,6 +11,9 @@ from rig import Rig
 from check import Server
 
 PROGRAMS = {
+    # wrapped lines a resize has to reflow, then an idle prompt
+    "shell": ["/bin/bash", "--norc", "--noprofile", "-c",
+              "for i in 1 2 3; do printf 'long-%d-' $i; printf 'x%.0s' {1..64}; echo; done; echo short; exec bash --norc --noprofile -i"],
     "claude": ["claude"],
     "top": ["top", "-s", "1"],
     "vim": ["vim", "-u", "NONE", "-N", "+set number", "/etc/services"],

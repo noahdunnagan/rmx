@@ -11,24 +11,25 @@ use serde_json::{json, Value};
 
 use crate::input::{self, Key, KeyPress, Mouse, Token};
 use crate::model::{Model, State};
-use crate::rex::Control;
+use crate::rex::{self, Control};
+use crate::ui::Tap;
 use crate::view::View;
 use crate::Msg;
 
 pub const RAIL_W: usize = 30;
-/// Narrower than this and the rail gives way to a full-screen switcher.
+/// Narrower than this and the rail gives way to a full-screen list.
 pub const WIDE: usize = 100;
 const SHELL: &str = "com.superlogical.terminal.shell";
 
 pub enum Mode {
     Normal,
-    /// ^B pressed; the next key is an rmx action.
+    /// The menu is up (^B or the ⋯ button); the next key or tap picks.
     Prefix,
-    /// Picking a tab: `sel` indexes `rows()`.
+    /// The list of tabs: `sel` indexes `rows()`. On a phone this is home.
     Switch { sel: usize },
     Scroll,
     Prompt { kind: Prompt, buf: String },
-    Confirm { session: String, tab: String, name: String },
+    Confirm(Confirm),
 }
 
 pub enum Prompt {
@@ -36,7 +37,13 @@ pub enum Prompt {
     RenameSession(String),
 }
 
-/// One line of the rail / switcher.
+pub enum Confirm {
+    Close { session: String, tab: String, name: String },
+    /// Rex's server cannot start shells; restarting it ends `tabs` tabs.
+    Restart { tabs: usize },
+}
+
+/// One line of the rail / list.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Row {
     Session(String),
@@ -45,6 +52,8 @@ pub enum Row {
     Block(String, String, String),
     AddTab(String),
     AddSession,
+    /// "No Rex sessions yet."
+    Empty,
     Blank,
 }
 
@@ -73,21 +82,33 @@ pub enum Action {
     Literal,
 }
 
-/// The ^B menu, in the order it is shown.
-pub const MENU: [(&str, &str, Action); 13] = [
-    ("s", "tabs", Action::Switcher),
-    ("c", "new tab", Action::NewTab),
-    ("S", "new session", Action::NewSession),
-    ("n", "next tab", Action::NextTab),
-    ("p", "previous tab", Action::PrevTab),
-    ("o", "tab that needs you", Action::Attention),
-    ("[", "scroll back", Action::Scroll),
-    ("r", "rename tab", Action::RenameTab),
-    ("$", "rename session", Action::RenameSession),
-    ("x", "close tab", Action::CloseTab),
-    ("b", "toggle rail", Action::ToggleRail),
-    ("g", "grab size + redraw", Action::Refresh),
-    ("d", "detach", Action::Quit),
+pub struct MenuItem {
+    pub key: &'static str,
+    pub label: &'static str,
+    /// Said after the label, dimmed: what the item means.
+    pub hint: &'static str,
+    pub action: Action,
+    /// Only makes sense with a tab open.
+    pub needs_tab: bool,
+}
+
+const fn item(key: &'static str, label: &'static str, hint: &'static str, action: Action, needs_tab: bool) -> MenuItem {
+    MenuItem { key, label, hint, action, needs_tab }
+}
+
+/// The menu, in the order it is shown.
+pub const MENU: [MenuItem; 11] = [
+    item("s", "all tabs", "", Action::Switcher, false),
+    item("c", "new tab", "a shell next to this one", Action::NewTab, false),
+    item("S", "new session", "its own group of tabs", Action::NewSession, false),
+    item("o", "needs you", "next tab waiting on you", Action::Attention, false),
+    item("[", "scroll back", "", Action::Scroll, true),
+    item("r", "rename tab", "", Action::RenameTab, true),
+    item("$", "rename session", "", Action::RenameSession, true),
+    item("x", "close tab", "", Action::CloseTab, true),
+    item("g", "redraw", "and take the size back", Action::Refresh, true),
+    item("b", "sidebar", "show or hide", Action::ToggleRail, false),
+    item("d", "detach", "tabs keep running", Action::Quit, false),
 ];
 
 fn prefixed(k: &KeyPress) -> Option<Action> {
@@ -116,10 +137,19 @@ fn prefixed(k: &KeyPress) -> Option<Action> {
     })
 }
 
+/// A message above the footer, kept until the next key or tap.
+pub struct Note {
+    pub text: String,
+    pub error: bool,
+}
+
 pub struct App {
     pub rex: Control,
     socket: PathBuf,
+    /// Using Rex's own server (not `--server`), so rmx may start it.
+    manage_server: bool,
     tx: Sender<Msg>,
+    pub control_gen: u64,
     pub model: Model,
     pub view: Option<View>,
     generation: u64,
@@ -129,9 +159,11 @@ pub struct App {
     pub rail: bool,
     pub bg: Option<Rgb>,
     pub tick: usize,
-    pub note: Option<(String, Instant)>,
+    pub note: Option<Note>,
+    /// When the server went away; rmx keeps trying to get it back.
+    pub lost: Option<Instant>,
     pub quit: bool,
-    /// First row of the rail / switcher list on screen.
+    /// First row of the rail / list on screen.
     pub list_offset: usize,
     /// Bytes for the outer terminal besides the frame: mode switches.
     pub out: Vec<u8>,
@@ -141,11 +173,13 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(rex: Control, socket: PathBuf, tx: Sender<Msg>, model: Model, cols: usize, rows: usize) -> App {
+    pub fn new(rex: Control, socket: PathBuf, manage_server: bool, tx: Sender<Msg>, model: Model, cols: usize, rows: usize) -> App {
         App {
             rex,
             socket,
+            manage_server,
             tx,
+            control_gen: 0,
             model,
             view: None,
             generation: 0,
@@ -156,6 +190,7 @@ impl App {
             bg: None,
             tick: 0,
             note: None,
+            lost: None,
             quit: false,
             list_offset: 0,
             out: Vec::new(),
@@ -175,11 +210,27 @@ impl App {
         (x, self.cols.saturating_sub(x).max(10), self.rows.saturating_sub(1).max(2))
     }
 
-    pub fn flash(&mut self, text: impl Into<String>) {
-        self.note = Some((text.into(), Instant::now()));
+    pub fn error(&mut self, text: impl Into<String>) {
+        self.note = Some(Note { text: text.into(), error: true });
+    }
+
+    pub fn info(&mut self, text: impl Into<String>) {
+        self.note = Some(Note { text: text.into(), error: false });
     }
 
     // ---- viewing ------------------------------------------------------
+
+    /// Where rmx starts: wide, straight into the last tab; on a phone, the
+    /// list with the last tab picked.
+    pub fn home(&mut self, last: Option<(String, String)>) {
+        if self.wide() {
+            return self.open_initial(last);
+        }
+        let rows = self.rows();
+        let tab = last.and_then(|(s, b)| Some((s.clone(), self.model.session(&s)?.tabs.iter().find(|t| t.blocks.contains(&b))?.id.clone())));
+        let sel = tab.and_then(|(s, t)| rows.iter().position(|r| *r == Row::Tab(s.clone(), t.clone()))).unwrap_or(0);
+        self.mode = Mode::Switch { sel: self.nearest_selectable(sel) };
+    }
 
     /// Open the tab Rex had focused last time, else the first one there is.
     pub fn open_initial(&mut self, last: Option<(String, String)>) {
@@ -216,7 +267,7 @@ impl App {
                 crate::save_last(session, block);
                 self.view = Some(v);
             }
-            Err(e) => self.flash(format!("could not open that tab: {e}")),
+            Err(e) => self.error(format!("Couldn't open that tab: {e}")),
         }
         self.mirror_modes();
     }
@@ -239,6 +290,7 @@ impl App {
                 self.rex.post_block(&v.session, &v.block, "resize", json!({"columns": pc, "rows": pr, "mode": "take"}));
             }
         }
+        self.settle();
     }
 
     /// Make the outer terminal encode keys the way the block's program asked
@@ -261,6 +313,64 @@ impl App {
             self.out.extend_from_slice(format!("\x1b[={};1u", kitty(want)).as_bytes());
         }
         self.mirrored = want & (TermMode::APP_CURSOR | TermMode::APP_KEYPAD | TermMode::BRACKETED_PASTE | TermMode::FOCUS_IN_OUT | TermMode::KITTY_KEYBOARD_PROTOCOL);
+    }
+
+    // ---- the server -----------------------------------------------------
+
+    /// Connect again (starting Rex's server if rmx manages it) and pick up
+    /// where we were.
+    pub fn reconnect(&mut self) -> Result<(), String> {
+        let generation = self.control_gen + 1;
+        let rex = crate::connect(&self.socket, self.manage_server, generation, self.tx.clone())?;
+        let model = Model::load(&rex)?;
+        let was = self.view.take().map(|v| (v.session, v.block));
+        (self.rex, self.model, self.control_gen, self.lost) = (rex, model, generation, None);
+        if !matches!(self.mode, Mode::Switch { .. }) {
+            self.mode = Mode::Normal;
+        }
+        if was.is_some() {
+            self.open_initial(was);
+        }
+        self.settle();
+        Ok(())
+    }
+
+    /// Restart Rex's server with the installed app's binary, then try
+    /// `retry` again.
+    fn restart_server(&mut self, retry: Action) {
+        let Some(bin) = rex::find_rex() else {
+            return self.error("Rex's server needs a restart, but rmx can't find the Rex app. Quit and reopen Rex on the Mac.");
+        };
+        self.leave();
+        if let Err(e) = rex::stop_server(&bin).and_then(|_| rex::start_server(&bin)) {
+            return self.error(format!("Couldn't restart Rex's server: {e}"));
+        }
+        match self.reconnect() {
+            Ok(()) => {
+                self.info("Restarted Rex's server.");
+                self.run(retry);
+            }
+            Err(e) => self.error(format!("Restarted Rex's server but couldn't reconnect: {e}")),
+        }
+    }
+
+    /// A tab or session could not be made.
+    fn create_failed(&mut self, err: String) {
+        // An old server whose own executable moved in a Rex update: it can
+        // no longer spawn anything until it restarts.
+        if !err.contains("posix_spawn") {
+            return self.error(format!("Rex couldn't start that: {err}"));
+        }
+        if !self.manage_server {
+            return self.error("Rex can't start new shells: its server is older than the Rex app (Rex updated). Restart Rex's server.");
+        }
+        match self.model.all_tabs().len() {
+            0 => self.restart_server(Action::NewTab),
+            tabs => {
+                self.info(format!("Rex can't start new shells: its server is older than the Rex app (Rex updated). Restarting it fixes that but closes the {tabs} open tab{}.", if tabs == 1 { "" } else { "s" }));
+                self.mode = Mode::Confirm(Confirm::Restart { tabs });
+            }
+        }
     }
 
     // ---- rex events ---------------------------------------------------
@@ -313,13 +423,15 @@ impl App {
         for s in std::mem::take(&mut self.stale) {
             self.model.refresh(&self.rex, &s);
         }
-        if let Some(v) = &self.view {
-            if !self.model.blocks.contains_key(&v.block) {
-                self.view = None;
-            }
+        if self.view.as_ref().is_some_and(|v| !self.model.blocks.contains_key(&v.block)) {
+            self.view = None;
         }
         if self.view.is_none() {
-            self.open_initial(None);
+            if self.wide() {
+                self.open_initial(None);
+            } else if matches!(self.mode, Mode::Normal | Mode::Scroll) {
+                self.mode = Mode::Switch { sel: 0 };
+            }
         }
         if let Mode::Switch { sel } = self.mode {
             self.mode = Mode::Switch { sel: self.nearest_selectable(sel) };
@@ -331,6 +443,9 @@ impl App {
 
     pub fn rows(&self) -> Vec<Row> {
         let mut rows = Vec::new();
+        if self.model.sessions.is_empty() {
+            rows.extend([Row::Empty, Row::Blank]);
+        }
         for s in &self.model.sessions {
             rows.push(Row::Session(s.id.clone()));
             for t in &s.tabs {
@@ -396,13 +511,25 @@ impl App {
     }
 
     pub fn activate(&mut self, row: Row) {
+        let sel = self.rows().iter().position(|r| *r == row).unwrap_or(0);
         self.mode = Mode::Normal;
         match row {
             Row::Tab(s, t) | Row::Detail(s, t) => self.open_tab(&s, &t),
             Row::Block(s, t, b) => self.open(&s, &t, &b),
             Row::AddTab(s) => self.new_tab(&s),
             Row::AddSession => self.new_session(),
-            Row::Session(_) | Row::Blank => {}
+            Row::Session(_) | Row::Empty | Row::Blank => self.mode = Mode::Switch { sel },
+        }
+        // On a phone, a failed open lands back on the list.
+        if self.view.is_none() && !self.wide() && matches!(self.mode, Mode::Normal) {
+            self.mode = Mode::Switch { sel: self.nearest_selectable(sel) };
+        }
+    }
+
+    /// Leave the list for the tab on screen, if there is one.
+    fn back(&mut self) {
+        if self.view.is_some() || self.wide() {
+            self.mode = Mode::Normal;
         }
     }
 
@@ -433,7 +560,7 @@ impl App {
                 let (tab, block) = (r["window_id"].as_str().unwrap_or_default().to_string(), r["block_ids"][0].as_str().unwrap_or_default().to_string());
                 self.open(session, &tab, &block);
             }
-            Err(e) => self.flash(format!("new tab failed: {e}")),
+            Err(e) => self.create_failed(e),
         }
     }
 
@@ -446,7 +573,7 @@ impl App {
                 let (tab, block) = (w["window_id"].as_str().unwrap_or_default().to_string(), w["block_ids"][0].as_str().unwrap_or_default().to_string());
                 self.open(&session, &tab, &block);
             }
-            Err(e) => self.flash(format!("new session failed: {e}")),
+            Err(e) => self.create_failed(e),
         }
     }
 
@@ -470,7 +597,7 @@ impl App {
         let next = (1..=tabs.len()).map(|i| &tabs[(here + i) % tabs.len()]).find(|t| wants(t)).cloned();
         match next {
             Some((s, t)) => self.open_tab(&s, &t),
-            None => self.flash("nothing needs you"),
+            None => self.info("Nothing is waiting on you."),
         }
     }
 
@@ -514,7 +641,7 @@ impl App {
             Action::CloseTab => {
                 if let Some((s, t)) = self.here() {
                     let name = self.model.tab(&s, &t).map(|tab| self.model.tab_name(tab)).unwrap_or_default();
-                    self.mode = Mode::Confirm { session: s, tab: t, name };
+                    self.mode = Mode::Confirm(Confirm::Close { session: s, tab: t, name });
                 }
             }
             Action::RenameTab => {
@@ -546,13 +673,15 @@ impl App {
             Action::Quit => self.quit = true,
             Action::Literal => self.send(b"\x02"),
         }
+        self.settle();
     }
 
     fn close_tab(&mut self, session: &str, tab: &str) {
         if let Err(e) = self.rex.call("session.close_window", json!({"session_id": session, "window_id": tab})) {
-            self.flash(format!("close failed: {e}"));
+            self.error(format!("Couldn't close it: {e}"));
         }
         self.stale.insert(session.to_string());
+        self.settle();
     }
 
     fn apply_prompt(&mut self, kind: Prompt, label: String) {
@@ -561,10 +690,21 @@ impl App {
             Prompt::RenameSession(s) => self.rex.call("session.set_label", json!({"session_id": s, "label": label})),
         };
         if let Err(e) = result {
-            self.flash(format!("rename failed: {e}"));
+            self.error(format!("Couldn't rename it: {e}"));
         }
         let (Prompt::RenameTab(s, _) | Prompt::RenameSession(s)) = kind;
         self.stale.insert(s);
+    }
+
+    /// Yes / no on whatever is being confirmed or typed.
+    fn answer(&mut self, yes: bool) {
+        match std::mem::replace(&mut self.mode, Mode::Normal) {
+            Mode::Confirm(Confirm::Close { session, tab, .. }) if yes => self.close_tab(&session, &tab),
+            Mode::Confirm(Confirm::Restart { .. }) if yes => self.restart_server(Action::NewTab),
+            Mode::Prompt { kind, buf } if yes => self.apply_prompt(kind, buf.trim().to_string()),
+            _ => {}
+        }
+        self.settle();
     }
 
     // ---- input --------------------------------------------------------
@@ -574,6 +714,11 @@ impl App {
         let Some(v) = &mut self.view else { return };
         if v.term.grid().display_offset() > 0 {
             v.term.scroll_display(Scroll::Bottom);
+        }
+        // Typing here means using it here: take the size back from the Mac.
+        if v.sized_by_other {
+            v.sized_by_other = false;
+            self.rex.post_block(&v.session, &v.block, "resize", json!({"columns": v.want.0, "rows": v.want.1, "mode": "take"}));
         }
         let text = String::from_utf8_lossy(bytes);
         for chunk in text.as_bytes().chunks(256 * 1024) {
@@ -591,7 +736,19 @@ impl App {
             }
             if let Token::Mouse(m, _) = token {
                 self.flush(&mut forward);
+                if m.is_left_click() {
+                    self.note = None;
+                }
                 self.mouse(m);
+                continue;
+            }
+            self.note = None;
+            if self.lost.is_some() {
+                if let Token::Key(k, _) = token {
+                    if k.ctrl('c') || k.ctrl('d') || k.key == Key::Char('q') {
+                        self.quit = true;
+                    }
+                }
                 continue;
             }
             match (&mut self.mode, &token) {
@@ -623,15 +780,16 @@ impl App {
             Mode::Normal => {}
             Mode::Prefix => match prefixed(&k) {
                 Some(a) => self.run(a),
-                None => self.mode = Mode::Normal,
+                None => self.back_or_list(),
             },
             Mode::Switch { sel } => {
                 let sel = *sel;
+                let row = self.rows().get(sel).cloned();
                 match k.key {
                     Key::Up | Key::Char('k') => self.mode = Mode::Switch { sel: self.step(sel, -1) },
                     Key::Down | Key::Char('j') | Key::Tab => self.mode = Mode::Switch { sel: self.step(sel, 1) },
                     Key::Enter | Key::Char(' ') => {
-                        if let Some(row) = self.rows().get(sel).cloned() {
+                        if let Some(row) = row {
                             self.activate(row);
                         }
                     }
@@ -645,24 +803,26 @@ impl App {
                             Some(s) => self.new_tab(&s),
                             None => self.new_session(),
                         }
+                        self.settle();
                     }
                     Key::Char('S' | 'N' | 'C') => {
                         self.mode = Mode::Normal;
                         self.new_session();
+                        self.settle();
                     }
                     Key::Char('x') => {
-                        if let Some(Row::Tab(s, t)) = self.rows().get(sel).cloned() {
+                        if let Some(Row::Tab(s, t)) = row {
                             let name = self.model.tab(&s, &t).map(|tab| self.model.tab_name(tab)).unwrap_or_default();
-                            self.mode = Mode::Confirm { session: s, tab: t, name };
+                            self.mode = Mode::Confirm(Confirm::Close { session: s, tab: t, name });
                         }
                     }
                     Key::Char('r') => {
-                        if let Some(Row::Tab(s, t)) = self.rows().get(sel).cloned() {
+                        if let Some(Row::Tab(s, t)) = row {
                             self.mode = Mode::Prompt { kind: Prompt::RenameTab(s, t), buf: String::new() };
                         }
                     }
-                    Key::Esc | Key::Char('q') => self.mode = Mode::Normal,
-                    Key::Char('b') if k.mods.ctrl => self.mode = Mode::Normal,
+                    Key::Esc | Key::Char('q') => self.back(),
+                    Key::Char('b') if k.mods.ctrl => self.mode = Mode::Prefix,
                     _ => {}
                 }
             }
@@ -687,11 +847,8 @@ impl App {
                 }
             }
             Mode::Prompt { buf, .. } => match k.key {
-                Key::Enter => {
-                    let Mode::Prompt { kind, buf } = std::mem::replace(&mut self.mode, Mode::Normal) else { unreachable!() };
-                    self.apply_prompt(kind, buf.trim().to_string());
-                }
-                Key::Esc => self.mode = Mode::Normal,
+                Key::Enter => self.answer(true),
+                Key::Esc => self.answer(false),
                 Key::Backspace => {
                     buf.pop();
                 }
@@ -699,17 +856,14 @@ impl App {
                 _ if raw.iter().all(|b| *b >= 0x20) => buf.push_str(&String::from_utf8_lossy(raw)),
                 _ => {}
             },
-            Mode::Confirm { session, tab, .. } => {
-                let (s, t) = (session.clone(), tab.clone());
-                match k.key {
-                    Key::Char('y' | 'Y') | Key::Enter => {
-                        self.mode = Mode::Normal;
-                        self.close_tab(&s, &t);
-                    }
-                    _ => self.mode = Mode::Normal,
-                }
-            }
+            Mode::Confirm(_) => self.answer(matches!(k.key, Key::Char('y' | 'Y') | Key::Enter)),
         }
+    }
+
+    /// Close the menu: back to the tab, or the list when there is none.
+    fn back_or_list(&mut self) {
+        self.mode = Mode::Normal;
+        self.settle();
     }
 
     /// The answer to rmx's own OSC 11 background query, if this is it.
@@ -723,26 +877,51 @@ impl App {
         }
     }
 
+    pub fn tap(&mut self, tap: Tap) {
+        match tap {
+            Tap::Run(a) => self.run(a),
+            Tap::Menu => self.mode = if matches!(self.mode, Mode::Prefix) { Mode::Normal } else { Mode::Prefix },
+            Tap::Back => self.back(),
+            Tap::Bottom => {
+                if let Some(v) = &mut self.view {
+                    v.term.scroll_display(Scroll::Bottom);
+                }
+                self.mode = Mode::Normal;
+            }
+            Tap::Yes => self.answer(true),
+            Tap::No => self.answer(false),
+            Tap::Quit => self.quit = true,
+        }
+        if matches!(self.mode, Mode::Normal) {
+            self.settle();
+        }
+    }
+
     fn mouse(&mut self, m: Mouse) {
         let (x, y) = (m.x.saturating_sub(1) as usize, m.y.saturating_sub(1) as usize);
         let footer = self.rows.saturating_sub(1);
         let (px, pcols, prows) = self.pane_rect();
         if y == footer {
             if m.is_left_click() {
-                self.footer_tap(x);
+                if let Some(t) = crate::ui::footer_hit(self, x) {
+                    self.tap(t);
+                }
             }
+            return;
+        }
+        if self.lost.is_some() {
             return;
         }
         if let Mode::Prefix = self.mode {
             if m.is_left_click() {
                 match crate::ui::menu_hit(self, x, y) {
                     Some(a) => self.run(a),
-                    None => self.mode = Mode::Normal,
+                    None => self.back_or_list(),
                 }
             }
             return;
         }
-        if let Mode::Confirm { .. } | Mode::Prompt { .. } = self.mode {
+        if let Mode::Confirm(_) | Mode::Prompt { .. } = self.mode {
             return;
         }
         let in_list = if self.wide() { x < RAIL_W } else { matches!(self.mode, Mode::Switch { .. }) };
@@ -791,31 +970,5 @@ impl App {
         }
         v.term.scroll_display(Scroll::Delta(-d * 3));
         self.mode = if v.term.grid().display_offset() > 0 { Mode::Scroll } else { Mode::Normal };
-    }
-
-    fn footer_tap(&mut self, x: usize) {
-        match &self.mode {
-            Mode::Confirm { session, tab, .. } => {
-                let (s, t) = (session.clone(), tab.clone());
-                let close = crate::ui::confirm_hit(self, x);
-                self.mode = Mode::Normal;
-                if close == Some(true) {
-                    self.close_tab(&s, &t);
-                }
-            }
-            Mode::Prompt { .. } => {}
-            Mode::Prefix => self.mode = Mode::Normal,
-            Mode::Scroll => {
-                if let Some(v) = &mut self.view {
-                    v.term.scroll_display(Scroll::Bottom);
-                }
-                self.mode = Mode::Normal;
-            }
-            Mode::Switch { .. } => self.mode = Mode::Normal,
-            Mode::Normal => match crate::ui::footer_hit(self, x) {
-                Some(a) => self.run(a),
-                None => self.mode = Mode::Prefix,
-            },
-        }
     }
 }
