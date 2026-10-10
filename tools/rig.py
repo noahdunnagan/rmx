@@ -13,7 +13,7 @@ RMX = os.environ.get("RMX_BIN", os.path.join(HERE, "..", "target", "debug", "rmx
 
 
 class Rig:
-    def __init__(self, socket, cols=160, rows=45, bg="1414/1414/1414", home="/tmp/rmx-rig-home"):
+    def __init__(self, socket, cols=160, rows=45, bg="1414/1414/1414", home="/tmp/rmx-rig-home", argv=None):
         os.makedirs(home, exist_ok=True)
         self.cols, self.rows, self.bg = cols, rows, bg
         self.screen = pyte.Screen(cols, rows)
@@ -21,9 +21,12 @@ class Rig:
         self.raw = b""
         pid, fd = pty.fork()
         if pid == 0:
-            os.environ.update({"TERM": "xterm-256color", "HOME": home})
+            os.environ["TERM"] = "xterm-256color"
             os.environ.pop("REX_SERVER", None)
-            os.execv(RMX, [RMX, "--server", socket])
+            if argv is None:
+                os.environ["HOME"] = home  # keep rmx's "last tab" file out of the real one
+                argv = [RMX, "--server", socket]
+            os.execvp(argv[0], argv)
         self.pid, self.fd = pid, fd
         self.resize(cols, rows)
         self.pump(0.6)

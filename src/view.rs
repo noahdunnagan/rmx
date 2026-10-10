@@ -60,11 +60,12 @@ pub struct View {
 impl View {
     #[allow(clippy::too_many_arguments)]
     pub fn open(rex: &Control, socket: &Path, session: &str, tab: &str, block: &str, size: (usize, usize), generation: u64, tx: Sender<Msg>) -> Result<View, String> {
-        let (cols, rows) = size;
-        rex.block(session, block, "resize", json!({"columns": cols, "rows": rows, "mode": "take"}))?;
-        // Seed from Rex's own rendering (screen + scrollback + modes), then
-        // follow the live stream. The binary snapshot on the stream would be
-        // gap-free, but it is Ghostty's private format.
+        // Seed from Rex's own rendering (screen + scrollback + modes) at the
+        // block's current size, then follow the live stream. The binary
+        // snapshot on the stream would be gap-free, but it is Ghostty's
+        // private format.
+        let now = rex.block(session, block, "size", json!({}))?;
+        let current = Size { cols: now["columns"].as_u64().unwrap_or(80) as usize, rows: now["rows"].as_u64().unwrap_or(24) as usize };
         let seed = rex.block(
             session,
             block,
@@ -76,9 +77,13 @@ impl View {
         let ticket = ticket["ticket"].as_str().and_then(crate::base64::decode).ok_or("rex sent a bad data ticket")?;
         let stream = DataStream::open(socket, &ticket, generation, tx).map_err(|e| e.to_string())?;
         let config = Config { scrolling_history: SCROLLBACK, kitty_keyboard: true, ..Config::default() };
-        let mut term = Term::new(config, &Size { cols, rows }, Sink);
+        let mut term = Term::new(config, &current, Sink);
         let mut parser = Processor::new();
         parser.advance(&mut term, seed["content"].as_str().unwrap_or_default().as_bytes());
+        // Only now take the size: Rex marks the resize in the stream and the
+        // program's redraw follows it, so neither can fall between the seed
+        // and the stream.
+        rex.post_block(session, block, "resize", json!({"columns": size.0, "rows": size.1, "mode": "take"}));
         Ok(View {
             session: session.into(),
             tab: tab.into(),
