@@ -19,7 +19,7 @@ use crate::Msg;
 pub const RAIL_W: usize = 30;
 /// Narrower than this and the rail gives way to a full-screen list.
 pub const WIDE: usize = 100;
-const SHELL: &str = "com.superlogical.terminal.shell";
+pub const SHELL: &str = "com.superlogical.terminal.shell";
 
 pub enum Mode {
     Normal,

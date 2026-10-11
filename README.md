@@ -16,6 +16,14 @@ A window is what Rex shows on the Mac: one window of tabs (Rex calls it a sessio
 
 `^B` then: `s` tabs, `c` new tab, `S` new window, `n`/`p` next/previous, `o` the next tab waiting on you, `[` scroll back, `r` rename tab, `x` close tab, `g` redraw, `d` detach. `^B ^B` sends a literal `^B`.
 
+## Snapshot and restore
+
+Rex loses every window and tab when its server restarts (an app update, a crash). `rmx --snapshot` writes down what is open to `~/.local/state/rmx/snapshot.json`: each window's name, each tab's name and folder, and the ck session name of every tab running ck. A launchd timer (`~/Library/LaunchAgents/rmx.snapshot.plist`, every 30 s) runs it; it never starts Rex's server.
+
+After a restart, `rmx --restore` rebuilds them: a window per window, a shell in each folder with `ck --resume <name>` typed in. Running it again is safe, since open windows and running ck sessions are skipped. A restarted server comes back nearly empty, so the snapshot is not replaced until the new server has as many tabs as the old picture.
+
+A split tab comes back as separate tabs.
+
 ## Notes
 
 - While a tab is open in rmx it takes the phone's size; the Mac shows "Sized by another client" until you leave it. Typing in rmx takes the size back if the Mac grabbed it.

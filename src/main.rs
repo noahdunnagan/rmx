@@ -7,6 +7,7 @@ mod input;
 mod model;
 mod render;
 mod rex;
+mod snapshot;
 mod ui;
 mod view;
 mod ws;
@@ -33,7 +34,10 @@ pub enum Msg {
 
 const USAGE: &str = "rmx — drive Rex from any terminal
 
-usage: rmx [--server PATH]
+usage: rmx [--server PATH] [--snapshot | --restore]
+
+  --snapshot   write down every open window and tab (a launchd timer runs this)
+  --restore    reopen them after Rex restarted, resuming each ck session
 
   ^B s   tabs        ^B c   new tab       ^B S   new session
   ^B n/p next/prev   ^B o   needs you     ^B [   scroll back
@@ -51,16 +55,24 @@ extern "C" fn on_signal(_: libc::c_int) {
 
 fn main() {
     let mut server = std::env::var("REX_SERVER").ok();
+    let mut job = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "-S" | "--server" => server = args.next(),
+            "--snapshot" => job = Some(false),
+            "--restore" => job = Some(true),
             "-V" | "--version" => return println!("rmx {}", env!("CARGO_PKG_VERSION")),
             _ => return println!("{USAGE}"),
         }
     }
     let manage_server = server.is_none();
-    if let Err(e) = run(socket_path(server), manage_server) {
+    let socket = socket_path(server);
+    let done = match job {
+        Some(restore) => snapshot::run(restore, &socket, manage_server).map(|line| println!("{line}")),
+        None => run(socket, manage_server),
+    };
+    if let Err(e) = done {
         eprintln!("rmx: {e}");
         std::process::exit(1);
     }

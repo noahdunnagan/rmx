@@ -35,6 +35,8 @@ pub struct Status {
     pub state: State,
     pub app: String,
     pub msg: String,
+    /// What the program calls this: ck reports its session name.
+    pub title: String,
 }
 
 /// Ordered by how much it wants the user.
@@ -58,7 +60,8 @@ impl Status {
             _ => return None,
         };
         let app = v["effective_app"].as_str().or(v["app"].as_str()).unwrap_or_default().to_string();
-        Some(Status { state, app, msg: v["msg"].as_str().unwrap_or_default().to_string() })
+        let text = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+        Some(Status { state, app, msg: text("msg"), title: text("title") })
     }
 }
 
