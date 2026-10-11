@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 use crate::app::{App, Mode};
 use crate::model::{Model, State};
 use crate::render::Frame;
+use crate::snapshot::Job;
 
 pub enum Msg {
     Input(Vec<u8>),
@@ -34,9 +35,10 @@ pub enum Msg {
 
 const USAGE: &str = "rmx — drive Rex from any terminal
 
-usage: rmx [--server PATH] [--snapshot | --restore]
+usage: rmx [--server PATH] [--snapshot | --watch | --restore]
 
-  --snapshot   write down every open window and tab (a launchd timer runs this)
+  --snapshot   write down every open window and tab, once
+  --watch      the same every 30 s, forever (launchd keeps this running)
   --restore    reopen them after Rex restarted, resuming each ck session
 
   ^B s   tabs        ^B c   new tab       ^B S   new session
@@ -60,8 +62,9 @@ fn main() {
     while let Some(a) = args.next() {
         match a.as_str() {
             "-S" | "--server" => server = args.next(),
-            "--snapshot" => job = Some(false),
-            "--restore" => job = Some(true),
+            "--snapshot" => job = Some(Job::Snapshot),
+            "--restore" => job = Some(Job::Restore),
+            "--watch" => job = Some(Job::Watch),
             "-V" | "--version" => return println!("rmx {}", env!("CARGO_PKG_VERSION")),
             _ => return println!("{USAGE}"),
         }
@@ -69,7 +72,7 @@ fn main() {
     let manage_server = server.is_none();
     let socket = socket_path(server);
     let done = match job {
-        Some(restore) => snapshot::run(restore, &socket, manage_server).map(|line| println!("{line}")),
+        Some(job) => snapshot::run(job, &socket, manage_server).map(|line| println!("{line}")),
         None => run(socket, manage_server),
     };
     if let Err(e) = done {

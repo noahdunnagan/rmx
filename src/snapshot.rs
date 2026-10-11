@@ -31,20 +31,43 @@ fn count(snap: &Value) -> usize {
     snap["sessions"].as_array().into_iter().flatten().map(|s| s["tabs"].as_array().map_or(0, Vec::len)).sum()
 }
 
-/// `restore` may start Rex's server; a snapshot never does, since it runs
-/// from a timer.
-pub fn run(restore: bool, socket: &Path, manage_server: bool) -> Result<String, String> {
+pub enum Job {
+    Snapshot,
+    Restore,
+    /// Snapshot every 30 s, for launchd to keep alive.
+    Watch,
+}
+
+/// Only a restore may start Rex's server; snapshots run unattended.
+pub fn run(job: Job, socket: &Path, manage_server: bool) -> Result<String, String> {
+    let restore = matches!(job, Job::Restore);
+    if matches!(job, Job::Watch) {
+        loop {
+            let _ = once(false, socket, false);
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
+    }
+    once(restore, socket, manage_server && restore)
+}
+
+fn once(restore: bool, socket: &Path, start_server: bool) -> Result<String, String> {
     let (tx, _events) = mpsc::channel();
-    let rex = crate::connect(socket, manage_server && restore, 0, tx)?;
+    let rex = crate::connect(socket, start_server, 0, tx)?;
+    let done = work(&rex, restore);
+    rex.close();
+    done
+}
+
+fn work(rex: &Control, restore: bool) -> Result<String, String> {
     let mut model = Model::default();
     let list = rex.call("session.list", json!({}))?;
     for s in list["sessions"].as_array().into_iter().flatten().filter_map(|s| s["session_id"].as_str()) {
-        model.add(&rex, s);
+        model.add(rex, s);
     }
     if restore {
-        restore_all(&rex, &model)
+        restore_all(rex, &model)
     } else {
-        take(&rex, &model)
+        take(rex, &model)
     }
 }
 

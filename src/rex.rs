@@ -96,6 +96,11 @@ impl Control {
         let _ = self.request(method, payload, None);
     }
 
+    /// Hang up; the reader thread ends with the socket.
+    pub fn close(&self) {
+        self.writer.shutdown();
+    }
+
     pub fn block(&self, session: &str, block: &str, method: &str, args: Value) -> Result<Value, String> {
         self.call("block.method", json!({"session_id": session, "block_id": block, "method": method, "args": args}))
     }

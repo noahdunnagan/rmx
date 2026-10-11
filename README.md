@@ -18,7 +18,7 @@ A window is what Rex shows on the Mac: one window of tabs (Rex calls it a sessio
 
 ## Snapshot and restore
 
-Rex loses every window and tab when its server restarts (an app update, a crash). `rmx --snapshot` writes down what is open to `~/.local/state/rmx/snapshot.json`: each window's name, each tab's name and folder, and the ck session name of every tab running ck. A launchd timer (`~/Library/LaunchAgents/rmx.snapshot.plist`, every 30 s) runs it; it never starts Rex's server.
+Rex loses every window and tab when its server restarts (an app update, a crash). `rmx --snapshot` writes down what is open to `~/.local/state/rmx/snapshot.json`: each window's name, each tab's name and folder, and the ck session name of every tab running ck. `rmx --watch` does it every 30 s; a launchd agent (`~/Library/LaunchAgents/rmx.snapshot.plist`, KeepAlive) runs that. Neither starts Rex's server. (launchd's `StartInterval` never fired on this Mac, hence the loop.)
 
 After a restart, `rmx --restore` rebuilds them: a window per window, a shell in each folder with `ck --resume <name>` typed in. Running it again is safe, since open windows and running ck sessions are skipped. A restarted server comes back nearly empty, so the snapshot is not replaced until the new server has as many tabs as the old picture.
 
