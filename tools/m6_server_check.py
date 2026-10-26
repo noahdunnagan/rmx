@@ -1,5 +1,5 @@
 """The paths that touch Rex's own server, run on a spare Mac with Rex
-installed (the M6): rmx over ssh starts a stopped server, and recovers a
+installed: rmx over ssh starts a stopped server, and recovers a
 server left behind by a Rex update. Destroys that Mac's Rex sessions.
 
     python3 tools/m6_server_check.py <ssh-host>
